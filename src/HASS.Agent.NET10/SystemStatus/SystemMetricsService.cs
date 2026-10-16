@@ -748,23 +748,97 @@ internal sealed class SystemMetricsService : IDisposable
         return Math.Max(0, idleMilliseconds / 1000);
     }
 
+    // The user's session: the console's when someone is signed in at the screen. On a PC used
+    // only over Remote Desktop the console shows the sign-in screen with nobody in it
+    // ("connected", no user), so then the active session with a user is taken, and failing
+    // that one that was disconnected without signing out.
     private static (string State, string User) ReadSessionStatus()
     {
-        var sessionId = WTSGetActiveConsoleSessionId();
-        if (sessionId == uint.MaxValue)
+        var consoleId = WTSGetActiveConsoleSessionId();
+        var sessions = ReadUserSessions();
+        if (sessions is null)
         {
-            return ("none", string.Empty);
+            // The list could not be read: the console's session alone, as before.
+            return consoleId == uint.MaxValue
+                ? ("none", string.Empty)
+                : (QuerySessionConnectState(consoleId), LimitState(QuerySessionUser(consoleId)));
         }
 
-        var state = QuerySessionConnectState(sessionId);
+        var chosen = ChooseUserSession(sessions.Select(session => (session.Id, session.State)).ToList(), consoleId);
+        if (chosen >= 0)
+        {
+            return (sessions[chosen].State, LimitState(sessions[chosen].User));
+        }
+
+        return consoleId == uint.MaxValue ? ("none", string.Empty) : (QuerySessionConnectState(consoleId), string.Empty);
+    }
+
+    private static string QuerySessionUser(uint sessionId)
+    {
         var userName = QuerySessionString(sessionId, WtsInfoClass.UserName);
+        if (string.IsNullOrWhiteSpace(userName))
+        {
+            return string.Empty;
+        }
+
         var domain = QuerySessionString(sessionId, WtsInfoClass.DomainName);
+        return string.IsNullOrWhiteSpace(domain) ? userName : $"{domain}\\{userName}";
+    }
 
-        var user = string.IsNullOrWhiteSpace(userName)
-            ? string.Empty
-            : string.IsNullOrWhiteSpace(domain) ? userName : $"{domain}\\{userName}";
+    /// <summary>
+    /// Index of the session to report among the sessions with a user: the console's, else
+    /// the first active one, else the first one at all (disconnected). -1 without any.
+    /// </summary>
+    internal static int ChooseUserSession(IReadOnlyList<(uint Id, string State)> sessions, uint consoleId)
+    {
+        for (var index = 0; index < sessions.Count; index++)
+        {
+            if (sessions[index].Id == consoleId)
+            {
+                return index;
+            }
+        }
 
-        return (state, LimitState(user));
+        for (var index = 0; index < sessions.Count; index++)
+        {
+            if (sessions[index].State == "active")
+            {
+                return index;
+            }
+        }
+
+        return sessions.Count > 0 ? 0 : -1;
+    }
+
+    // The sessions with a signed-in user, in Windows' order; null when they cannot be listed
+    // (as opposed to a list with nobody signed in).
+    private static List<(uint Id, string State, string User)>? ReadUserSessions()
+    {
+        var sessions = new List<(uint, string, string)>();
+        if (!WTSEnumerateSessions(IntPtr.Zero, 0, 1, out var sessionsPointer, out var sessionCount))
+        {
+            return null;
+        }
+
+        try
+        {
+            var itemSize = Marshal.SizeOf<WtsSessionInfo>();
+            for (var index = 0; index < sessionCount; index++)
+            {
+                var session = Marshal.PtrToStructure<WtsSessionInfo>(IntPtr.Add(sessionsPointer, index * itemSize));
+                var user = QuerySessionUser(session.SessionId);
+                if (user.Length > 0)
+                {
+                    sessions.Add((session.SessionId, QuerySessionConnectState(session.SessionId), user));
+                }
+            }
+        }
+        finally
+        {
+            WTSFreeMemory(sessionsPointer);
+        }
+
+        return sessions;
     }
 
     private static bool? ReadClipboardTextAvailable()
