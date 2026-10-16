@@ -1,7 +1,9 @@
 using HASS.Agent.Companion.Http;
 using HASS.Agent.Companion.Localization;
 using HASS.Agent.Companion.Logging;
+using HASS.Agent.Companion.Runtime;
 using Microsoft.Toolkit.Uwp.Notifications;
+using Microsoft.Win32;
 using Windows.UI.Notifications;
 
 namespace HASS.Agent.Companion.Tray;
@@ -47,6 +49,113 @@ internal sealed class ToastPresenter
         {
             _log.Warning($"Windows notifications are not available: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// The name above the app's notifications: the given text, or the app's own name for
+    /// null/empty. Windows takes it from the app's registration, which the toolkit writes
+    /// again at each start (after <see cref="Listen"/>), so this runs after that and after
+    /// every save of the settings. False when the registration could not be written.
+    /// </summary>
+    public bool ApplyName(string? name)
+    {
+        var displayName = string.IsNullOrWhiteSpace(name) ? AppIdentity.DisplayName : name.Trim();
+        try
+        {
+            using var key = FindRegistration();
+            if (key is null)
+            {
+                _log.Warning("The app's notification registration was not found; the notification name stays as it is.");
+                return false;
+            }
+
+            if (!string.Equals(key.GetValue("DisplayName") as string, displayName, StringComparison.Ordinal))
+            {
+                key.SetValue("DisplayName", displayName);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.Warning($"Unable to set the notification name: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Removes the app's notifications from the notification centre. Windows keeps showing
+    /// the name it read for the app while the app has notifications there, so a changed name
+    /// shows only once they are gone. False when that failed.
+    /// </summary>
+    public bool ClearNotificationCentre()
+    {
+        try
+        {
+            ToastNotificationManagerCompat.History.Clear();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.Warning($"Unable to clear the app's notifications: {ex.Message}");
+            return false;
+        }
+    }
+
+    // HKCU\Software\Classes\AppUserModelId\<AUMID>: the one whose COM activator (registered
+    // by the toolkit) starts this exe. Other installs and other apps are left alone.
+    private static RegistryKey? FindRegistration()
+    {
+        var exe = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exe))
+        {
+            return null;
+        }
+
+        using var aumids = Registry.CurrentUser.OpenSubKey(@"Software\Classes\AppUserModelId");
+        foreach (var aumid in aumids?.GetSubKeyNames() ?? [])
+        {
+            using var candidate = aumids!.OpenSubKey(aumid);
+            if (candidate?.GetValue("CustomActivator") is not string clsid || !Guid.TryParse(clsid, out var activator))
+            {
+                continue;
+            }
+
+            using var server = Registry.CurrentUser.OpenSubKey($@"Software\Classes\CLSID\{{{activator}}}\LocalServer32");
+            if (server?.GetValue(null) is string command && CommandStarts(command, exe))
+            {
+                return aumids.OpenSubKey(aumid, writable: true);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Whether a LocalServer32 command starts this exe: the quoted program path, or the
+    /// whole command when it has no arguments. Not a substring match, which another install
+    /// whose path contains this one would pass.
+    /// </summary>
+    internal static bool CommandStarts(string command, string exe)
+    {
+        var trimmed = command.Trim();
+        string program;
+        if (trimmed.StartsWith('"'))
+        {
+            var end = trimmed.IndexOf('"', 1);
+            if (end < 0)
+            {
+                return false;
+            }
+
+            program = trimmed[1..end];
+        }
+        else
+        {
+            program = trimmed;
+        }
+
+        return string.Equals(program, exe, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

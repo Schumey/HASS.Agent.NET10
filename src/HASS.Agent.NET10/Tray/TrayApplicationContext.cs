@@ -24,6 +24,7 @@ internal sealed class TrayApplicationContext : ApplicationContext, INotification
     private readonly NotificationImageCache _notificationImages;
     private readonly ToastPresenter _toasts;
     private string? _toastRefusal;
+    private string? _notificationName;
     private Action? _pendingBalloonAction;
     private MainForm? _mainForm;
     private WebViewForm? _dashboardPopup;
@@ -48,6 +49,54 @@ internal sealed class TrayApplicationContext : ApplicationContext, INotification
     /// <summary>Set by Program: asks Home Assistant for a user of this PC's own and its token.</summary>
     public Func<Task<(string Token, string User)>>? HaUserProvisioner { get; set; }
 
+    // Windows reads the app's name again only once the app has no notifications left in the
+    // notification centre, so a changed name clears them and shows from the next one. Only
+    // when the name changes: a start, or a save that keeps it, leaves the centre alone.
+    private void ApplyNotificationName()
+    {
+        var name = _settings.EffectiveNotificationName;
+        // Nothing is cleared when the name could not be written, and the name counts as
+        // applied only once both worked, so the next save, or the next start, tries again.
+        if (_toasts.ApplyName(name) &&
+            !string.Equals(name, _notificationName, StringComparison.Ordinal) &&
+            _toasts.ClearNotificationCentre())
+        {
+            _notificationName = name;
+            StoreAppliedNotificationName(name);
+        }
+    }
+
+    // The name the notification centre was last cleared for, kept for the user (the
+    // registration is the user's too) so that a clear that failed is retried after a restart.
+    private const string UserKeyPath = @"Software\HASS.Agent.NET10";
+    private const string AppliedNotificationNameValue = "AppliedNotificationName";
+
+    private static string? ReadAppliedNotificationName()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(UserKeyPath);
+            return key?.GetValue(AppliedNotificationNameValue) is string { Length: > 0 } name ? name : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private void StoreAppliedNotificationName(string? name)
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(UserKeyPath);
+            key.SetValue(AppliedNotificationNameValue, name ?? string.Empty);
+        }
+        catch (Exception ex)
+        {
+            _log.Warning($"Unable to remember the notification name: {ex.Message}");
+        }
+    }
+
     public TrayApplicationContext(CompanionSettings settings, AppPaths paths, FileLog log)
     {
         _settings = settings;
@@ -60,6 +109,10 @@ internal sealed class TrayApplicationContext : ApplicationContext, INotification
         _toasts = new ToastPresenter(log);
         _toasts.ActionSelected += RaiseNotificationAction;
         _toasts.Listen();
+        // The toolkit has just written the app's own name: put the chosen one back, and clear
+        // the centre if a change of name has not reached it yet.
+        _notificationName = ReadAppliedNotificationName();
+        ApplyNotificationName();
 
         _hotkeys = new HotkeyService(log);
         _hotkeys.Pressed += (_, hotkey) => HotkeyPressed?.Invoke(this, hotkey);
@@ -240,6 +293,7 @@ internal sealed class TrayApplicationContext : ApplicationContext, INotification
         _mainForm.SettingsSaved += (_, _) =>
         {
             _hotkeys.Apply(_settings.Hotkeys);
+            ApplyNotificationName();
             SettingsSaved?.Invoke(this, EventArgs.Empty);
         };
         _mainForm.FormClosed += (_, _) => _mainForm = null;
@@ -386,7 +440,7 @@ internal sealed class TrayApplicationContext : ApplicationContext, INotification
 
     private void ShowWindowNotification(NotificationPayload notification, string? imageFile)
     {
-        var form = new ActionNotificationForm(notification, imageFile, RaiseNotificationAction);
+        var form = new ActionNotificationForm(notification, imageFile, RaiseNotificationAction, _settings.EffectiveNotificationName);
 
         _actionNotifications.Add(form);
         form.FormClosed += (_, _) =>
