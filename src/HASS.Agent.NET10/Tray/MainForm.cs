@@ -90,6 +90,11 @@ internal sealed class MainForm : Form
     private readonly NumericUpDown _webViewHeight = new() { Minimum = WebViewOptions.MinimumEdge, Maximum = WebViewOptions.MaximumEdge, Increment = 20 };
     private readonly CheckBox _webViewOnClick = new();
     private readonly CheckBox _capMedia = new();
+    private readonly CheckBox _mediaCoverArt = new();
+    private readonly CheckBox _announceVolumeEnabled = new();
+    private readonly NumericUpDown _announceVolume = new() { Minimum = 1, Maximum = 100, Increment = 5 };
+    private readonly CheckBox _announcePausesMedia = new();
+    private readonly Label _powerCommandsState = new();
     private readonly CheckBox _capSensorsService = new();
     private readonly CheckBox _capSensorsApp = new();
     private readonly NumericUpDown _fastSensorInterval = new() { Minimum = 10, Maximum = 3600 };
@@ -171,6 +176,7 @@ internal sealed class MainForm : Form
         _content.Controls.Add(BuildMqttPage());
         _content.Controls.Add(BuildHaApiPage());
         _content.Controls.Add(BuildCapabilitiesPage());
+        _content.Controls.Add(BuildMediaPlayerPage());
         _content.Controls.Add(BuildSensorsPage());
         _content.Controls.Add(BuildServicePage());
         _content.Controls.Add(BuildAboutPage());
@@ -254,7 +260,7 @@ internal sealed class MainForm : Form
         };
 
         var navContainer = new Panel { Dock = DockStyle.Fill, BackColor = SidebarBg };
-        string[] navKeys = ["Nav.General", "Nav.Mqtt", "Nav.HaApi", "Nav.Capabilities", "Nav.Sensors", "Nav.Service", "Nav.About", "Nav.DangerZone"];
+        string[] navKeys = ["Nav.General", "Nav.Mqtt", "Nav.HaApi", "Nav.Capabilities", "Nav.MediaPlayer", "Nav.Sensors", "Nav.Service", "Nav.About", "Nav.DangerZone"];
         for (var i = 0; i < navKeys.Length; i++)
             navContainer.Controls.Add(CreateNavItem(S(navKeys[i]), i));
 
@@ -946,7 +952,7 @@ internal sealed class MainForm : Form
 
         AddPageTitle(page, S("Cap.Title"));
 
-        var card1 = MakeCard(page, 28, 56, 600, 370, S("Cap.Functions"));
+        var card1 = MakeCard(page, 28, 56, 600, 340, S("Cap.Functions"));
         var y = 44;
         y = AddCheck(card1, _capNotify, S("Cap.Notifications"), y);
         // Same order as NotificationStyleValues.
@@ -984,7 +990,6 @@ internal sealed class MainForm : Form
         nameTip.SetToolTip(nameInfo, S("Cap.CustomNotificationNameHint"));
         card1.Controls.Add(nameInfo);
         y += 36;
-        y = AddCheck(card1, _capMedia, S("Cap.MediaPlayer"), y);
         y = AddCheck(card1, _capSensorsService, S("Cap.SensorsService"), y);
         y = AddCheck(card1, _capSensorsApp, S("Cap.SensorsApp"), y);
         y += 6;
@@ -1004,7 +1009,7 @@ internal sealed class MainForm : Form
             Text = S("Cap.Seconds"), Location = Pt(296, y - 30), AutoSize = true, ForeColor = TextMuted
         });
 
-        var cmdY = 438;
+        var cmdY = 408;
         var card2 = MakeCard(page, 28, cmdY, 600, 50 + SystemCommandCatalog.Commands.Count * 30 + 16, S("Cap.Commands"));
         y = 44;
         card2.Controls.Add(new Label { Text = "Tray", Font = new Font("Segoe UI", 8.5F, FontStyle.Bold), ForeColor = TextMuted, Location = Pt(320, y), AutoSize = true });
@@ -1020,12 +1025,14 @@ internal sealed class MainForm : Form
             });
 
             var tray = new CheckBox { Location = Pt(324, y), AutoSize = true, Enabled = cmd.SupportsTrayApp };
+            tray.CheckedChanged += (_, _) => RefreshPowerCommandsState();
             card2.Controls.Add(tray);
 
             CheckBox? service = null;
             if (cmd.SupportsService)
             {
                 service = new CheckBox { Location = Pt(418, y), AutoSize = true };
+                service.CheckedChanged += (_, _) => RefreshPowerCommandsState();
                 card2.Controls.Add(service);
             }
             else
@@ -1243,6 +1250,80 @@ internal sealed class MainForm : Form
         {
             row.SetValues(editor.Result.Enabled, editor.Result.Name, editor.Result.Keys);
         }
+    }
+
+    private Panel BuildMediaPlayerPage()
+    {
+        var page = MakePage();
+
+        AddPageTitle(page, S("Mp.Title"));
+
+        var card1 = MakeCard(page, 28, 56, 600, 150, S("Mp.Player"));
+        AddCardHelp(card1, S("Mp.PlayerHelp"));
+        var y = 78;
+        y = AddCheck(card1, _capMedia, S("Cap.MediaPlayer"), y);
+        AddCheck(card1, _mediaCoverArt, S("Mp.CoverArt"), y);
+
+        var card2 = MakeCard(page, 28, 226, 600, 190, S("Mp.Announcements"));
+        AddCardHelp(card2, S("Mp.AnnouncementsHelp"));
+        y = 78;
+        y = AddCheck(card2, _announceVolumeEnabled, S("Mp.AnnounceVolume"), y);
+        y = AddField(card2, S("Mp.AnnounceVolumeLevel"), _announceVolume, y + 2, inputWidth: 100);
+        card2.Controls.Add(new Label
+        {
+            Text = "%", Location = Pt(296, y - 30), AutoSize = true, ForeColor = TextMuted
+        });
+        AddCheck(card2, _announcePausesMedia, S("Mp.AnnouncePauses"), y + 2);
+        _announceVolumeEnabled.CheckedChanged += (_, _) =>
+        {
+            _announceVolume.Enabled = _announceVolumeEnabled.Checked;
+            _announcePausesMedia.Enabled = _announceVolumeEnabled.Checked;
+        };
+
+        // Nothing to set here: turning the PC on and off from the media player lives in the
+        // integration's options, and the PC's part is the commands it allows on Capabilities.
+        var card3 = MakeCard(page, 28, 436, 600, 266, S("Mp.Power"));
+        // Six lines of 8.5 pt text in Hungarian at the design width.
+        var powerHelp = new Label
+        {
+            Text = S("Mp.PowerHelp"), Location = Pt(20, 40), Size = Sz(560, 110),
+            ForeColor = TextMuted, Font = new Font("Segoe UI", 8.5F)
+        };
+        card3.Controls.Add(powerHelp);
+        FollowCardWidth(card3, powerHelp);
+        card3.Controls.Add(new Label
+        {
+            Text = S("Mp.PowerCommands"), Location = Pt(20, 158), Size = Sz(560, 22), ForeColor = TextBody
+        });
+        // One command per line: the three together do not fit a line in Hungarian.
+        _powerCommandsState.Location = Pt(20, 182);
+        _powerCommandsState.Size = Sz(560, 64);
+        _powerCommandsState.ForeColor = TextBody;
+        _powerCommandsState.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
+        card3.Controls.Add(_powerCommandsState);
+        FollowCardWidth(card3, _powerCommandsState);
+
+        return page;
+    }
+
+    /// <summary>Which of sleep, hibernate and shutdown the media player's turn off may use on this PC, as ticked on Capabilities.</summary>
+    private void RefreshPowerCommandsState()
+    {
+        var parts = new List<string>();
+        foreach (var row in _cmdRows)
+        {
+            if (row.Def.Name is not ("sleep" or "hibernate" or "shutdown"))
+            {
+                continue;
+            }
+
+            var by = new List<string>();
+            if (row.TrayApp.Checked) by.Add(S("Mp.PowerByTray"));
+            if (row.Service?.Checked == true) by.Add(S("Mp.PowerByService"));
+            parts.Add($"{S($"Cmd.{row.Def.Name}")}: {(by.Count == 0 ? S("Mp.PowerOff") : string.Join(", ", by))}");
+        }
+
+        _powerCommandsState.Text = string.Join(Environment.NewLine, parts);
     }
 
     private Panel BuildSensorsPage()
@@ -1802,36 +1883,45 @@ internal sealed class MainForm : Form
         });
 
         var githubBtn = MakeSecondaryButton("GitHub", 110, 32);
-        githubBtn.Location = Pt(28, 174);
         githubBtn.Click += (_, _) => OpenUrl(AppIdentity.GitHubRepositoryUrl);
-        card.Controls.Add(githubBtn);
 
         var issueBtn = MakeSecondaryButton(S("About.ReportIssue"), 150, 32);
-        issueBtn.Location = new Point(githubBtn.Right + D(8), D(174));
         issueBtn.Click += (_, _) => OpenUrl($"{AppIdentity.GitHubRepositoryUrl}/issues/new");
-        card.Controls.Add(issueBtn);
 
         // Release tags carry a "v" prefix and keep any pre-release suffix (v10.6.2-beta.1).
         var notesBtn = MakeSecondaryButton(S("About.ReleaseNotes"), 140, 32);
-        notesBtn.Location = new Point(issueBtn.Right + D(8), D(174));
         notesBtn.Click += (_, _) => OpenUrl($"{AppIdentity.GitHubRepositoryUrl}/releases/tag/v{_settings.SoftwareVersion}");
-        card.Controls.Add(notesBtn);
 
         var supportBtn = MakeSecondaryButton(S("About.Support"), 190, 32);
-        supportBtn.Location = Pt(28, 214);
         supportBtn.Click += (_, _) => OpenUrl(AppIdentity.SupportUrl);
-        card.Controls.Add(supportBtn);
 
         // The star is the one thing the project asks for, here and nowhere else in the app.
         var starBtn = MakeSecondaryButton(S("About.Star"), 170, 32);
-        starBtn.Location = new Point(supportBtn.Right + D(8), D(214));
         starBtn.Click += (_, _) => OpenUrl(AppIdentity.GitHubRepositoryUrl);
-        card.Controls.Add(starBtn);
 
         var updateBtn = MakePrimaryButton(S("About.CheckUpdates"), 160, 32);
-        updateBtn.Location = new Point(starBtn.Right + D(8), D(214));
         updateBtn.Click += async (_, _) => await CheckForUpdatesAsync(updateBtn);
-        card.Controls.Add(updateBtn);
+
+        // The buttons flow and wrap with the card: in a narrow window or a language with
+        // longer words the last one ran past the card's edge when each had a fixed place.
+        var buttons = new FlowLayoutPanel
+        {
+            Location = Pt(28, 174), Size = Sz(544, 72),
+            FlowDirection = FlowDirection.LeftToRight, WrapContents = true, BackColor = Color.Transparent
+        };
+        foreach (var button in new[] { githubBtn, issueBtn, notesBtn, supportBtn, starBtn, updateBtn })
+        {
+            button.Margin = new Padding(0, 0, D(8), D(8));
+            buttons.Controls.Add(button);
+        }
+        card.Controls.Add(buttons);
+        card.Layout += (_, _) =>
+        {
+            var width = Math.Max(D(200), card.ClientSize.Width - buttons.Left - D(20));
+            buttons.Width = width;
+            buttons.Height = buttons.GetPreferredSize(new Size(width, 0)).Height;
+            card.Height = buttons.Bottom + D(20);
+        };
 
         return page;
     }
@@ -2649,6 +2739,12 @@ internal sealed class MainForm : Form
         _notificationName.Text = _settings.CustomNotificationName;
         _notificationName.Enabled = _settings.CustomNotificationNameEnabled;
         _capMedia.Checked = _settings.MqttMediaPlayerEnabled;
+        _mediaCoverArt.Checked = _settings.MediaPlayerCoverArtEnabled;
+        _announceVolumeEnabled.Checked = _settings.AnnouncementVolumeEnabled;
+        _announceVolume.Value = Math.Clamp(_settings.AnnouncementVolume, 1, 100);
+        _announceVolume.Enabled = _settings.AnnouncementVolumeEnabled;
+        _announcePausesMedia.Checked = _settings.AnnouncementPausesMedia;
+        _announcePausesMedia.Enabled = _settings.AnnouncementVolumeEnabled;
         _capSensorsService.Checked = _settings.MqttServiceSystemSensorsEnabled;
         _capSensorsApp.Checked = _settings.MqttSystemSensorsEnabled;
         _fastSensorInterval.Value = _settings.FastSensorIntervalSeconds;
@@ -2661,6 +2757,7 @@ internal sealed class MainForm : Form
             if (row.Service is not null)
                 row.Service.Checked = _settings.IsServiceCommandEnabled(row.Def.Name);
         }
+        RefreshPowerCommandsState();
 
         foreach (var def in BuiltInSensorCatalog.Sensors)
         {
@@ -2927,6 +3024,10 @@ internal sealed class MainForm : Form
         _settings.CustomNotificationNameEnabled = _customNotificationName.Checked;
         _settings.CustomNotificationName = _notificationName.Text.Trim();
         _settings.MqttMediaPlayerEnabled = _capMedia.Checked;
+        _settings.MediaPlayerCoverArtEnabled = _mediaCoverArt.Checked;
+        _settings.AnnouncementVolumeEnabled = _announceVolumeEnabled.Checked;
+        _settings.AnnouncementVolume = (int)_announceVolume.Value;
+        _settings.AnnouncementPausesMedia = _announcePausesMedia.Checked;
         _settings.MqttServiceSystemSensorsEnabled = _capSensorsService.Checked;
         _settings.MqttSystemSensorsEnabled = _capSensorsApp.Checked;
         _settings.FastSensorIntervalSeconds = (int)_fastSensorInterval.Value;
