@@ -613,3 +613,38 @@ public class PublishPaceTests
         Assert.Equal(2, service.MemoryReads);
     }
 }
+
+public class PushReadTests
+{
+    [Fact]
+    public void A_push_read_refreshes_the_push_driven_sensors_only()
+    {
+        var log = new HASS.Agent.Companion.Logging.FileLog(Path.Combine(Path.GetTempPath(), "hass-agent-tests.log"));
+        using var service = new SystemMetricsService(log, null);
+        var builtIn = new List<BuiltInSensorSetting>
+        {
+            new() { Key = "memory_usage", TrayApp = true, Service = true },
+            new() { Key = "volume", TrayApp = true, Service = false }
+        };
+        var pushProfiles = new HashSet<SensorPollingProfile> { SensorPollingProfile.Fast, SensorPollingProfile.Normal };
+        // A fast custom sensor on a clock-driven source: a push event must not run it either.
+        var custom = new List<CustomSensorDefinition>
+        {
+            new() { Id = "mem", Type = CustomSensorTypes.BuiltInAttribute, Parameter = "memory_usage.used_gb", PollingProfile = "fast", TrayApp = true, Service = true }
+        };
+
+        var first = service.Read(custom, serviceRole: false, dueProfiles: SensorPollingProfiles.All, builtInSensors: builtIn);
+        Assert.Equal(1, service.MemoryReads);
+
+        // A push event: the fast memory usage is not push-driven, so it is left alone, and
+        // the custom sensor keeps its earlier state...
+        var pushed = service.Read(custom, serviceRole: false, dueProfiles: pushProfiles, builtInSensors: builtIn, pushOnly: true);
+        Assert.Equal(1, service.MemoryReads);
+        Assert.Same(first.CustomSensors.Single(), pushed.CustomSensors.Single());
+
+        // ...and a timed fast cycle reads both as before.
+        var timed = service.Read(custom, serviceRole: false, dueProfiles: pushProfiles, builtInSensors: builtIn);
+        Assert.Equal(2, service.MemoryReads);
+        Assert.NotSame(first.CustomSensors.Single(), timed.CustomSensors.Single());
+    }
+}

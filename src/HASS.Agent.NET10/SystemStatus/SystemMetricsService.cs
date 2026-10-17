@@ -133,7 +133,8 @@ internal sealed class SystemMetricsService : IDisposable
         IReadOnlyList<CustomSensorDefinition>? customSensors = null,
         bool serviceRole = false,
         IReadOnlySet<SensorPollingProfile>? dueProfiles = null,
-        IReadOnlyList<BuiltInSensorSetting>? builtInSensors = null)
+        IReadOnlyList<BuiltInSensorSetting>? builtInSensors = null,
+        bool pushOnly = false)
     {
         // The reads that cost something (a process start, performance counters, an event log
         // subscription) are skipped for a sensor nobody uses: not enabled for this role, and
@@ -161,7 +162,8 @@ internal sealed class SystemMetricsService : IDisposable
             profiles = SensorPollingProfiles.All;
         }
 
-        var updateNormal = profiles.Contains(SensorPollingProfile.Normal);
+        // The normal cycle proper; a push read is not one, whatever profiles it carries.
+        var updateNormal = !pushOnly && profiles.Contains(SensorPollingProfile.Normal);
         var updateStartup = profiles.Contains(SensorPollingProfile.Startup);
 
         // A sensor is read when it is wanted and its profile is due: the catalog's profile, or
@@ -171,14 +173,24 @@ internal sealed class SystemMetricsService : IDisposable
         bool Due(params string[] keys) =>
             previous is null ||
             keys.Any(key =>
-                (Wanted(key) && profiles.Contains(BuiltInSensorCatalog.EffectiveProfile(key, builtInSensors))) ||
-                CustomSensorDue(key));
+                Pushable(key) &&
+                ((Wanted(key) && profiles.Contains(BuiltInSensorCatalog.EffectiveProfile(key, builtInSensors))) ||
+                 CustomSensorDue(key)));
+
+        // A read for a push event (a volume change, a lock) refreshes the push-driven sensors
+        // only: the clock-driven ones keep their own pace, so an evening of media playing does
+        // not turn the uptime or the GPU into fast sensors.
+        bool Pushable(string key) => !pushOnly || BuiltInSensorCatalog.Find(key) is { PushDriven: true };
 
         // What Home Assistant is shown follows the built-in sensor's own profile: a custom
         // sensor on a faster profile refreshes the shared source, the built-in sensor still
         // publishes its value and attributes at its own pace (the first read shows everything).
+        // A push-driven sensor is always shown: it reports on change, and its profile (the
+        // last wake reason's is "startup") is only a safety net, never a gate.
         bool Shown(string key) =>
-            previous is null || profiles.Contains(BuiltInSensorCatalog.EffectiveProfile(key, builtInSensors));
+            previous is null ||
+            BuiltInSensorCatalog.Find(key) is { PushDriven: true } ||
+            (!pushOnly && profiles.Contains(BuiltInSensorCatalog.EffectiveProfile(key, builtInSensors)));
 
         // A custom sensor built on one of the sensor's attributes refreshes the source on its
         // own profile too: GPU usage on hourly with an adapter's load wanted every minute.
@@ -414,7 +426,7 @@ internal sealed class SystemMetricsService : IDisposable
             LastShutdownReason: Shown("last_shutdown_reason") ? (_lastShutdown.Summary) : previous!.LastShutdownReason,
             LastWakeReason: Shown("last_wake_reason") ? (lastWake?.Summary) : previous!.LastWakeReason,
             BootTime: Shown("boot_time") ? (updateStartup ? Safe(ReadBootTime, previous?.BootTime ?? ReadBootTimeFromTicks()) : previous!.BootTime) : previous!.BootTime,
-            CustomSensors: Safe(() => ReadCustomSensors(customSensors ?? [], serviceRole, attributes, profiles, previous?.CustomSensors ?? []), previous?.CustomSensors ?? []),
+            CustomSensors: Safe(() => ReadCustomSensors(customSensors ?? [], serviceRole, attributes, profiles, previous?.CustomSensors ?? [], pushOnly), previous?.CustomSensors ?? []),
             Attributes: shownAttributes,
             UpdatedAt: DateTimeOffset.UtcNow);
 
@@ -2178,16 +2190,25 @@ internal sealed class SystemMetricsService : IDisposable
         bool serviceRole,
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, object?>> attributes,
         IReadOnlySet<SensorPollingProfile> dueProfiles,
-        IReadOnlyList<CustomSensorState> previousStates)
+        IReadOnlyList<CustomSensorState> previousStates,
+        bool pushOnly = false)
     {
         var previousById = previousStates.ToDictionary(state => state.Id, StringComparer.OrdinalIgnoreCase);
+
+        // On a push read only a sensor built on a push-driven source is due: a command or a
+        // process check must not run because the volume changed.
+        static bool PushDrivenSource(CustomSensorDefinition sensor) =>
+            sensor.IsBuiltInAttribute && BuiltInSensorCatalog.ForAttributePath(sensor.Parameter) is { PushDriven: true };
 
         var active = sensors
             .Where(sensor => sensor.Enabled && (serviceRole ? sensor.Service : sensor.TrayApp))
             .ToList();
 
+        // On a push read a sensor on a push-driven source is due whatever its profile (it
+        // reports on change); on a timed read the profile decides.
         bool IsDue(CustomSensorDefinition sensor) =>
-            dueProfiles.Contains(sensor.EffectivePollingProfile) || !previousById.ContainsKey(sensor.Id);
+            !previousById.ContainsKey(sensor.Id) ||
+            (pushOnly ? PushDrivenSource(sensor) : dueProfiles.Contains(sensor.EffectivePollingProfile));
 
         // Command sensors can each block up to the command timeout, so run the due ones
         // concurrently — a slow or hung command then delays the snapshot by roughly one
