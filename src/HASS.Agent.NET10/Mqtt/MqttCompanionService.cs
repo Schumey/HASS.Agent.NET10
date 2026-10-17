@@ -2232,7 +2232,7 @@ internal sealed class MqttCompanionService : IDisposable
             .Select(sensor => new BuiltInSensorDescriptor(
                 sensor!.Key,
                 Localization.Strings.GetHa($"Sensor.{sensor.Key}"),
-                SensorPollingProfiles.ToKey(sensor.PollingProfile),
+                SensorPollingProfiles.ToKey(BuiltInSensorCatalog.EffectiveProfile(sensor.Key, _settings.BuiltInSensors)),
                 sensor.HasMultipleValues,
                 sensor.DefaultAttributePath,
                 sensor.AttributePaths,
@@ -2271,7 +2271,8 @@ internal sealed class MqttCompanionService : IDisposable
                 PublishedParameter(sensor),
                 SensorPollingProfiles.NormalizeKey(sensor.PollingProfile, SensorPollingProfile.Normal),
                 unit,
-                null,
+                // A class from the unit: a °C sensor then shows as °F where that is the custom.
+                CustomSensorUnits.DeviceClassFor(unit),
                 unit is not null ? "measurement" : null,
                 sensor.Type switch
                 {

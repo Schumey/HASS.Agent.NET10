@@ -300,6 +300,8 @@ internal static partial class Strings
             ["Sensors.Value"] = "Érték",
             ["Sensors.Add"] = "Hozzáadás",
             ["Sensors.Remove"] = "Törlés",
+            ["Sensors.RemoveConfirm"] = "Törlöd a kijelölt {0} sort?",
+            ["Sensors.ValueServiceOnly"] = "csak a szolgáltatásból, a tray appból nem tesztelhető",
             ["Sensors.TestValue"] = "Teszt",
             ["Sensors.NewSensor"] = "Új szenzor",
             ["Sensors.WindowTitle"] = "szenzorok",

@@ -300,6 +300,8 @@ internal static partial class Strings
             ["Sensors.Value"] = "Value",
             ["Sensors.Add"] = "Add",
             ["Sensors.Remove"] = "Remove",
+            ["Sensors.RemoveConfirm"] = "Remove the {0} selected rows?",
+            ["Sensors.ValueServiceOnly"] = "service only, not testable from the tray app",
             ["Sensors.TestValue"] = "Test",
             ["Sensors.NewSensor"] = "New sensor",
             ["Sensors.WindowTitle"] = "sensors",

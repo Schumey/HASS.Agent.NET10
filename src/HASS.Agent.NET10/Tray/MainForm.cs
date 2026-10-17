@@ -1094,11 +1094,7 @@ internal sealed class MainForm : Form
 
         var removeCmdBtn = MakeSecondaryButton(S("Sensors.Remove"), 90, 30);
         removeCmdBtn.Location = new Point(editCmdBtn.Right + D(8), D(212));
-        removeCmdBtn.Click += (_, _) =>
-        {
-            if (_customCommandGrid.CurrentRow is { IsNewRow: false } row)
-                _customCommandGrid.Rows.Remove(row);
-        };
+        removeCmdBtn.Click += (_, _) => RemoveSelectedRows(_customCommandGrid);
         card3.Controls.Add(removeCmdBtn);
 
         var card4 = MakeCard(page, 28, customY + 250 + 20, 600, 232, S("Cap.WebView"));
@@ -1163,11 +1159,7 @@ internal sealed class MainForm : Form
 
         var removeHotkeyBtn = MakeSecondaryButton(S("Sensors.Remove"), 90, 30);
         removeHotkeyBtn.Location = new Point(editHotkeyBtn.Right + D(8), D(212));
-        removeHotkeyBtn.Click += (_, _) =>
-        {
-            if (_hotkeyGrid.CurrentRow is { IsNewRow: false } row)
-                _hotkeyGrid.Rows.Remove(row);
-        };
+        removeHotkeyBtn.Click += (_, _) => RemoveSelectedRows(_hotkeyGrid);
         card5.Controls.Add(removeHotkeyBtn);
 
         return page;
@@ -1197,6 +1189,7 @@ internal sealed class MainForm : Form
     private void SetupHotkeyGrid()
     {
         StyleGrid(_hotkeyGrid);
+        _hotkeyGrid.MultiSelect = true;
         _hotkeyGrid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Enabled", HeaderText = S("Sensors.Active"), Width = D(50) });
         _hotkeyGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = S("Sensors.Name"), Width = D(220), ReadOnly = true });
         _hotkeyGrid.Columns.Add(new DataGridViewTextBoxColumn
@@ -1394,11 +1387,7 @@ internal sealed class MainForm : Form
 
         var removeBtn = MakeSecondaryButton(S("Sensors.Remove"), 90, 30);
         removeBtn.Location = new Point(editBtn.Right + D(8), D(6));
-        removeBtn.Click += (_, _) =>
-        {
-            if (_customGrid.CurrentRow is { IsNewRow: false } row)
-                _customGrid.Rows.Remove(row);
-        };
+        removeBtn.Click += (_, _) => RemoveSelectedRows(_customGrid);
         var testBtn = MakeSecondaryButton(S("Sensors.TestValue"), 110, 30);
         testBtn.Location = new Point(removeBtn.Right + D(8), D(6));
         testBtn.Click += async (_, _) => await UpdateSelectedCustomSensorValueAsync();
@@ -1486,10 +1475,15 @@ internal sealed class MainForm : Form
             Name = "Name", HeaderText = S("Sensors.Sensor"), AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
             MinimumWidth = D(200), ReadOnly = true
         });
-        _builtInGrid.Columns.Add(new DataGridViewTextBoxColumn
+        // Fast, normal or hourly is the user's choice; push-driven and startup sensors keep
+        // theirs (the cell is locked for them).
+        _builtInGrid.Columns.Add(new DataGridViewComboBoxColumn
         {
-            Name = "Profile", HeaderText = S("Sensors.Profile"), Width = D(92), ReadOnly = true,
-            SortMode = DataGridViewColumnSortMode.NotSortable
+            Name = "Profile", HeaderText = S("Sensors.Profile"), Width = D(100),
+            SortMode = DataGridViewColumnSortMode.NotSortable,
+            DataSource = BuildPollingProfileOptions(editableOnly: true),
+            DisplayMember = "Value", ValueMember = "Key",
+            FlatStyle = FlatStyle.Flat, DisplayStyle = DataGridViewComboBoxDisplayStyle.Nothing
         });
         _builtInGrid.Columns.Add(new DataGridViewTextBoxColumn
         {
@@ -1502,6 +1496,8 @@ internal sealed class MainForm : Form
     private void SetupCustomGrid()
     {
         StyleGrid(_customGrid);
+        // Shift and Ctrl pick several rows: Remove and Test then work on all of them.
+        _customGrid.MultiSelect = true;
         _customGrid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Enabled", HeaderText = S("Sensors.Active"), Width = D(50) });
         _customGrid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "TrayApp", HeaderText = "Tray", Width = D(50) });
         _customGrid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Service", HeaderText = "Svc", Width = D(50) });
@@ -1552,6 +1548,7 @@ internal sealed class MainForm : Form
     private void SetupCustomCommandGrid()
     {
         StyleGrid(_customCommandGrid);
+        _customCommandGrid.MultiSelect = true;
         _customCommandGrid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Enabled", HeaderText = S("Sensors.Active"), Width = D(50) });
         _customCommandGrid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "TrayApp", HeaderText = "Tray", Width = D(50) });
         _customCommandGrid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Service", HeaderText = "Svc", Width = D(50) });
@@ -1719,13 +1716,21 @@ internal sealed class MainForm : Form
 
     private static readonly System.Text.RegularExpressions.Regex AttributeIndex = new(@"\[(\d+)\]", System.Text.RegularExpressions.RegexOptions.Compiled);
 
-    private KeyValuePair<string, string>[] BuildPollingProfileOptions()
+    private KeyValuePair<string, string>[] BuildPollingProfileOptions(bool includePush = false, bool editableOnly = false)
     {
-        return Enum.GetValues<SensorPollingProfile>()
+        var options = Enum.GetValues<SensorPollingProfile>()
+            // Startup is never a choice for a built-in sensor; it is shown for a locked cell only.
+            .Where(profile => !editableOnly || profile != SensorPollingProfile.Startup)
             .Select(profile => new KeyValuePair<string, string>(
                 SensorPollingProfiles.ToKey(profile),
-                GetPollingProfileDisplayName(profile)))
-            .ToArray();
+                GetPollingProfileDisplayName(profile)));
+        if (includePush)
+        {
+            // Not a choice, only what a push-driven sensor's locked cell shows.
+            options = options.Append(new KeyValuePair<string, string>("push", S("PollingProfile.push")));
+        }
+
+        return options.ToArray();
     }
 
     private string GetPollingProfileDisplayName(SensorPollingProfile profile)
@@ -2803,9 +2808,19 @@ internal sealed class MainForm : Form
                 s?.TrayApp ?? def.SupportsTrayApp,
                 s?.Service ?? def.SupportsService,
                 S($"Sensor.{def.Key}"),
-                def.PushDriven ? S("PollingProfile.push") : GetPollingProfileDisplayName(def.PollingProfile),
+                def.PushDriven ? "push" : SensorPollingProfiles.ToKey(BuiltInSensorCatalog.EffectiveProfile(def, s)),
                 def.HasMultipleValues ? "+" : string.Empty);
             _builtInGrid.Rows[ri].Tag = def.Key;
+            if (!BuiltInSensorCatalog.CanChangeProfile(def))
+            {
+                // A locked cell shows "Startup" or "Push", which the column's own list does not offer.
+                var cell = (DataGridViewComboBoxCell)_builtInGrid.Rows[ri].Cells["Profile"];
+                cell.DataSource = BuildPollingProfileOptions(includePush: true);
+                cell.DisplayMember = "Value";
+                cell.ValueMember = "Key";
+                cell.ReadOnly = true;
+                cell.Style.BackColor = SystemColors.Control;
+            }
             if (!def.SupportsTrayApp) { _builtInGrid.Rows[ri].Cells["TrayApp"].ReadOnly = true; _builtInGrid.Rows[ri].Cells["TrayApp"].Style.BackColor = SystemColors.Control; }
             if (!def.SupportsService) { _builtInGrid.Rows[ri].Cells["Service"].ReadOnly = true; _builtInGrid.Rows[ri].Cells["Service"].Style.BackColor = SystemColors.Control; }
             if (def.HasMultipleValues)
@@ -2871,12 +2886,102 @@ internal sealed class MainForm : Form
         }
     }
 
+    // Every selected row at once (Shift or Ctrl picks several). The built-in attribute rows
+    // share one metrics read: each would otherwise run a full snapshot of its own, GPU
+    // sampling, event log and Windows Update search included.
     private async Task UpdateSelectedCustomSensorValueAsync()
     {
         _customGrid.EndEdit();
-        if (_customGrid.CurrentRow is { IsNewRow: false } row)
+        var rows = SelectedRows(_customGrid);
+        if (rows.Count == 0 && _customGrid.CurrentRow is { IsNewRow: false } current)
         {
-            await UpdateCustomSensorRowValueAsync(row);
+            rows = [current];
+        }
+
+        var tasks = new List<Task>();
+        var batch = new List<(DataGridViewRow Row, CustomSensorDefinition Sensor)>();
+        foreach (var row in rows)
+        {
+            var sensor = PrepareCustomSensorRowTest(row);
+            if (sensor is null)
+            {
+                continue;
+            }
+
+            if (sensor.IsBuiltInAttribute)
+            {
+                batch.Add((row, sensor));
+            }
+            else
+            {
+                tasks.Add(ReadCustomSensorRowValueAsync(row, sensor));
+            }
+        }
+
+        if (batch.Count > 0)
+        {
+            tasks.Add(ReadBuiltInAttributeRowsAsync(batch));
+        }
+
+        await Task.WhenAll(tasks);
+    }
+
+    private async Task ReadBuiltInAttributeRowsAsync(List<(DataGridViewRow Row, CustomSensorDefinition Sensor)> batch)
+    {
+        try
+        {
+            var values = await Task.Run(() => SystemMetricsService.TestCustomSensorValues(batch.Select(item => item.Sensor).ToList(), _log));
+            foreach (var (row, sensor) in batch)
+            {
+                if (row.DataGridView is null || row.DataGridView.IsDisposed)
+                {
+                    return;
+                }
+
+                row.Cells["Value"].Value = FormatSensorValue(values.GetValueOrDefault(sensor.Id));
+            }
+        }
+        catch (Exception ex)
+        {
+            foreach (var (row, _) in batch)
+            {
+                if (row.DataGridView is null || row.DataGridView.IsDisposed)
+                {
+                    return;
+                }
+
+                row.Cells["Value"].Value = string.Format(S("Sensors.ValueError"), ex.Message);
+            }
+        }
+    }
+
+    private static List<DataGridViewRow> SelectedRows(DataGridView grid) =>
+        grid.SelectedRows.Cast<DataGridViewRow>()
+            .Where(row => !row.IsNewRow)
+            .OrderBy(row => row.Index)
+            .ToList();
+
+    // Removes what is selected; more than one row asks first, since a slip with Shift
+    // would otherwise take a whole list with it.
+    private void RemoveSelectedRows(DataGridView grid)
+    {
+        grid.EndEdit();
+        var rows = SelectedRows(grid);
+        if (rows.Count == 0 && grid.CurrentRow is { IsNewRow: false } current)
+        {
+            rows = [current];
+        }
+
+        if (rows.Count > 1 &&
+            MessageBox.Show(this, string.Format(S("Sensors.RemoveConfirm"), rows.Count), AppIdentity.DisplayName,
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+        {
+            return;
+        }
+
+        foreach (var row in rows)
+        {
+            grid.Rows.Remove(row);
         }
     }
 
@@ -2908,9 +3013,20 @@ internal sealed class MainForm : Form
 
     private async Task UpdateCustomSensorRowValueAsync(DataGridViewRow row)
     {
+        var sensor = PrepareCustomSensorRowTest(row);
+        if (sensor is not null)
+        {
+            await ReadCustomSensorRowValueAsync(row, sensor);
+        }
+    }
+
+    // The row's sensor when there is something to read; otherwise the Value cell already
+    // says why not (no parameter, or an attribute only the service can read).
+    private CustomSensorDefinition? PrepareCustomSensorRowTest(DataGridViewRow row)
+    {
         if (row.IsNewRow || !_customGrid.Columns.Contains("Value"))
         {
-            return;
+            return null;
         }
 
         var valueCell = row.Cells["Value"];
@@ -2918,13 +3034,30 @@ internal sealed class MainForm : Form
         if (string.IsNullOrWhiteSpace(parameter))
         {
             valueCell.Value = S("Sensors.ValueMissingParameter");
-            return;
+            return null;
+        }
+
+        var sensor = BuildCustomSensorFromRow(row, forceEnabled: true);
+        // The rows' ids tell the results apart when several are read at once.
+        sensor.Id = Convert.ToString(row.Tag) is { Length: > 0 } id ? id : sensor.Id;
+
+        // An attribute of a sensor only the service reads (drive health): the tray app would
+        // only ever show null for it, so it says why instead.
+        if (sensor.IsBuiltInAttribute && BuiltInSensorCatalog.ForAttributePath(sensor.Parameter) is { SupportsTrayApp: false })
+        {
+            valueCell.Value = S("Sensors.ValueServiceOnly");
+            return null;
         }
 
         valueCell.Value = S("Sensors.ValueLoading");
+        return sensor;
+    }
+
+    private async Task ReadCustomSensorRowValueAsync(DataGridViewRow row, CustomSensorDefinition sensor)
+    {
+        var valueCell = row.Cells["Value"];
         try
         {
-            var sensor = BuildCustomSensorFromRow(row, forceEnabled: true);
             var value = await Task.Run(() => SystemMetricsService.TestCustomSensorValue(sensor, _log));
             if (row.DataGridView is null || row.DataGridView.IsDisposed)
             {
@@ -3108,7 +3241,9 @@ internal sealed class MainForm : Form
             {
                 Key = Convert.ToString(r.Tag) ?? string.Empty,
                 Service = Convert.ToBoolean(r.Cells["Service"].Value ?? false),
-                TrayApp = Convert.ToBoolean(r.Cells["TrayApp"].Value ?? false)
+                TrayApp = Convert.ToBoolean(r.Cells["TrayApp"].Value ?? false),
+                // Normalize() drops it again when it is the catalog's own or not allowed.
+                PollingProfile = r.Cells["Profile"].ReadOnly ? null : Convert.ToString(r.Cells["Profile"].Value)
             }).ToList();
 
         _customGrid.EndEdit();

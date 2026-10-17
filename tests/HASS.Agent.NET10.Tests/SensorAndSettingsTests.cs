@@ -503,3 +503,113 @@ public class SystemHealthTests
         Assert.DoesNotContain("memory_usage.total_mb", BuiltInSensorCatalog.EditorAttributePaths(memory));
     }
 }
+
+public class SensorProfileTests
+{
+    [Fact]
+    public void A_built_in_sensor_runs_on_the_profile_the_user_picked_when_it_may()
+    {
+        var gpu = BuiltInSensorCatalog.Find("gpu_usage")!;
+        var volume = BuiltInSensorCatalog.Find("volume")!;
+        var bootTime = BuiltInSensorCatalog.Find("boot_time")!;
+
+        Assert.True(BuiltInSensorCatalog.CanChangeProfile(gpu));
+        Assert.False(BuiltInSensorCatalog.CanChangeProfile(volume));
+        Assert.False(BuiltInSensorCatalog.CanChangeProfile(bootTime));
+
+        Assert.Equal(SensorPollingProfile.Fast, BuiltInSensorCatalog.EffectiveProfile(gpu, new BuiltInSensorSetting { Key = "gpu_usage", PollingProfile = "fast" }));
+        Assert.Equal(SensorPollingProfile.Hourly, BuiltInSensorCatalog.EffectiveProfile(gpu, new BuiltInSensorSetting { Key = "gpu_usage", PollingProfile = "HOURLY" }));
+        // The catalog's own when there is no choice, nonsense, startup, or a sensor that cannot move.
+        Assert.Equal(SensorPollingProfile.Normal, BuiltInSensorCatalog.EffectiveProfile(gpu, null));
+        Assert.Equal(SensorPollingProfile.Normal, BuiltInSensorCatalog.EffectiveProfile(gpu, new BuiltInSensorSetting { Key = "gpu_usage", PollingProfile = "weekly" }));
+        Assert.Equal(SensorPollingProfile.Normal, BuiltInSensorCatalog.EffectiveProfile(gpu, new BuiltInSensorSetting { Key = "gpu_usage", PollingProfile = "startup" }));
+        Assert.Equal(SensorPollingProfile.Fast, BuiltInSensorCatalog.EffectiveProfile(volume, new BuiltInSensorSetting { Key = "volume", PollingProfile = "hourly" }));
+        Assert.Equal(SensorPollingProfile.Startup, BuiltInSensorCatalog.EffectiveProfile(bootTime, new BuiltInSensorSetting { Key = "boot_time", PollingProfile = "fast" }));
+    }
+
+    [Fact]
+    public void Settings_keep_a_profile_only_when_it_is_a_real_change()
+    {
+        var settings = new CompanionSettings
+        {
+            BuiltInSensors =
+            [
+                new BuiltInSensorSetting { Key = "gpu_usage", Service = true, PollingProfile = "fast" },
+                new BuiltInSensorSetting { Key = "cpu_usage", Service = true, PollingProfile = "fast" },
+                new BuiltInSensorSetting { Key = "volume", TrayApp = true, PollingProfile = "hourly" },
+                new BuiltInSensorSetting { Key = "boot_time", Service = true, PollingProfile = "normal" },
+                new BuiltInSensorSetting { Key = "memory_usage", Service = true, PollingProfile = "sometimes" }
+            ]
+        };
+
+        settings.Normalize();
+
+        string? Profile(string key) => settings.BuiltInSensors.Single(sensor => sensor.Key == key).PollingProfile;
+        Assert.Equal("fast", Profile("gpu_usage"));
+        Assert.Null(Profile("cpu_usage"));
+        Assert.Null(Profile("volume"));
+        Assert.Null(Profile("boot_time"));
+        Assert.Null(Profile("memory_usage"));
+        Assert.Equal(SensorPollingProfile.Fast, BuiltInSensorCatalog.EffectiveProfile("gpu_usage", settings.BuiltInSensors));
+        Assert.Equal(SensorPollingProfile.Fast, BuiltInSensorCatalog.EffectiveProfile("cpu_usage", settings.BuiltInSensors));
+    }
+}
+
+public class CustomSensorUnitTests
+{
+    [Theory]
+    [InlineData("°C", "temperature")]
+    [InlineData(" °F ", "temperature")]
+    [InlineData("GB", "data_size")]
+    [InlineData("GiB", "data_size")]
+    [InlineData("MB/s", "data_rate")]
+    [InlineData("h", "duration")]
+    [InlineData("W", "power")]
+    [InlineData("MHz", "frequency")]
+    [InlineData("kWh", null)]
+    [InlineData("%", null)]
+    [InlineData("RPM", null)]
+    [InlineData("", null)]
+    [InlineData(null, null)]
+    public void A_custom_sensor_gets_a_device_class_from_its_unit(string? unit, string? deviceClass)
+    {
+        Assert.Equal(deviceClass, CustomSensorUnits.DeviceClassFor(unit));
+    }
+}
+
+public class PublishPaceTests
+{
+    [Fact]
+    public async Task A_fast_custom_sensor_refreshes_its_source_while_the_hourly_built_in_keeps_its_pace()
+    {
+        var log = new HASS.Agent.Companion.Logging.FileLog(Path.Combine(Path.GetTempPath(), "hass-agent-tests.log"));
+        using var service = new SystemMetricsService(log, null);
+        // Only the memory usage, on hourly: nothing else may touch the memory read.
+        var builtIn = new List<BuiltInSensorSetting>
+        {
+            new() { Key = "memory_usage", TrayApp = true, Service = true, PollingProfile = "hourly" }
+        };
+        var custom = new List<CustomSensorDefinition>
+        {
+            new() { Id = "mem", Type = CustomSensorTypes.BuiltInAttribute, Parameter = "memory_usage.available_gb", PollingProfile = "fast", TrayApp = true, Service = true }
+        };
+        var fast = new HashSet<SensorPollingProfile> { SensorPollingProfile.Fast };
+
+        // The first read takes everything.
+        var first = service.Read(custom, serviceRole: false, dueProfiles: SensorPollingProfiles.All, builtInSensors: builtIn);
+        Assert.Equal(1, service.MemoryReads);
+        await Task.Delay(50, TestContext.Current.CancellationToken);
+
+        // A fast cycle: the custom sensor is fast, so the memory is read again for it...
+        var second = service.Read(custom, serviceRole: false, dueProfiles: fast, builtInSensors: builtIn);
+        Assert.Equal(2, service.MemoryReads);
+        Assert.NotNull(second.CustomSensors.Single(sensor => sensor.Id == "mem").Value);
+        // ...while Home Assistant is shown the hourly sensor's earlier value and attributes.
+        Assert.Equal(first.MemoryUsage, second.MemoryUsage);
+        Assert.Same(first.Attributes["memory_usage"], second.Attributes["memory_usage"]);
+
+        // Without the custom sensor a fast cycle leaves the hourly memory read alone.
+        service.Read([], serviceRole: false, dueProfiles: fast, builtInSensors: builtIn);
+        Assert.Equal(2, service.MemoryReads);
+    }
+}
