@@ -2,6 +2,17 @@
 
 Every release of HASS.Agent .NET10, newest first. The downloads are on the [releases page](https://github.com/v1k70rk4/HASS.Agent.NET10/releases).
 
+## Unreleased
+
+- **Drive health**, a new built-in sensor from the Windows service: Windows' own verdict on the drives from their SMART data (`healthy`, `warning`, `unhealthy`, the worst of them as the value), with every drive in the attributes (`drives[N].name`, `health`, `temperature`, `temperature_max`, `power_on_hours`, `bus`, `media`) and the system drive's temperature as `temperature`, one attribute sensor away from a °C entity. NVMe drives report the temperature and its highest value, a SATA drive the temperature and the power-on hours when its controller passes them on, USB enclosures nothing; a field a drive does not report is left out. Needs the integration 10.9.2-beta.3 or newer. Service only, since reading it needs administrator rights.
+- **Attribute sensors made from the list get their unit**: °C for temperatures, h for hours, GB / MB for memory, % for loads; also when a path is picked from the list in the editor. An attribute sensor can only be ticked for a role that reads its built-in sensor (the drive health for the service, the active window for the app); the other box is greyed.
+- **`gpu_usage.name`**: which GPU the main value and the top-level engines and memory follow.
+- **Gigabytes next to megabytes**: `memory_dedicated_gb`, `memory_shared_gb` and `adapters[N].memory_gb`, `memory_dedicated_gb`, `memory_shared_gb` on GPU usage, one decimal; the `_mb` attributes stay, so sensors built on them keep working. The attribute list offers the GB ones.
+- **Memory and system drive totals**: `memory_usage` has `total_gb`, `used_gb`, `available_gb`; both system drive sensors have `drive`, `total_gb`, `used_gb`, `free_gb`.
+- **The attribute list follows this PC**: the Attributes button and the editor's list offer `adapters[1]`, `displays[1]`, `drives[1]` and so on for every item the sensor last reported, instead of `[0]` only; the second one's sensor gets a 2 after its name. For the drive health, which the app itself cannot read, it counts the disks Windows lists.
+- **Uptime moved to the normal profile** (every 60 seconds instead of every fast cycle): its value changes with every tick, so on the fast profile it wrote a new row to Home Assistant's recorder at every cycle for nothing.
+- **Fast sensors down to 1 second**: the fast interval goes to 5 seconds on the Capabilities page (10 stays the default); the **Fast sensors below 5 seconds** switch on the Danger Zone page unlocks 1–4 seconds, with a note on what that means for traffic and the recorder.
+
 ## 10.9.3-beta.4
 
 > **Beta.** Out on the beta channel: tick **Beta updates** on the Danger Zone page to be offered it, or take it from the [releases page](https://github.com/v1k70rk4/HASS.Agent.NET10/releases). The current stable release is **10.9.2**, below.
