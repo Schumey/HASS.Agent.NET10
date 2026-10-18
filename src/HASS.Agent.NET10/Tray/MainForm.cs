@@ -1849,7 +1849,7 @@ internal sealed class MainForm : Form
         {
             // Installing keeps only what was approved before; what the settings ask the
             // service to run beyond that is shown and approved separately, right after.
-            var (outcome, _) = await ElevatedRun.StartAsync("--install-service");
+            var (outcome, error) = await ElevatedRun.StartAsync("--install-service");
             if (outcome == ElevatedOutcome.Finished)
             {
                 await ServiceApproval.RequestIfNeededAsync(this, _settings, _log);
@@ -1858,6 +1858,23 @@ internal sealed class MainForm : Form
             {
                 _log.Warning("The service installation was not started: an earlier administrator run is still going.");
                 MessageBox.Show(this, S("Access.Busy"), AppIdentity.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else if (outcome == ElevatedOutcome.StillRunning)
+            {
+                _log.Warning("The service installation has not finished yet.");
+                MessageBox.Show(this, S("Access.StillRunning"), AppIdentity.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else if (outcome == ElevatedOutcome.NotStarted)
+            {
+                // No administrator run to say anything: this is the only place the user hears it.
+                _log.Warning($"The service installation could not be started: {error}");
+                MessageBox.Show(this, string.Format(S("Access.Failed"), error), AppIdentity.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            else if (outcome == ElevatedOutcome.Failed)
+            {
+                // The administrator run itself has told the user what went wrong (it runs
+                // without --quiet, so it shows its own message); here it goes to the log.
+                _log.Warning($"The service installation did not finish as asked: {error ?? "no detail"}.");
             }
 
             statusLabel.Text = CompanionServiceManager.GetStatusText();

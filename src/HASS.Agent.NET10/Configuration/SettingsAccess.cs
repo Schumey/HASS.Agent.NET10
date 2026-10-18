@@ -147,6 +147,18 @@ internal static class SettingsAccess
     /// </summary>
     internal static bool IsDirectoryAccount(string sid, SecurityIdentifier? machine = null)
     {
+        // A profile key that only looks like a SID (ProfileList is system data, but not trusted
+        // to be well formed) is nobody.
+        SecurityIdentifier parsed;
+        try
+        {
+            parsed = new SecurityIdentifier(sid);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+
         if (sid.StartsWith("S-1-12-1-", StringComparison.Ordinal))
         {
             return true;
@@ -158,15 +170,6 @@ internal static class SettingsAccess
         }
 
         machine ??= MachineSid.Value;
-        SecurityIdentifier parsed;
-        try
-        {
-            parsed = new SecurityIdentifier(sid);
-        }
-        catch (ArgumentException)
-        {
-            return false;
-        }
 
         // The PC's own SID unknown: a domain account cannot be told from a local one, and an
         // update must not take an unknown one for a local administrator.
@@ -246,8 +249,9 @@ internal static class SettingsAccess
         {
             return Sid(user);
         }
-        catch (IdentityNotMappedException)
+        catch (Exception ex) when (ex is IdentityNotMappedException or SystemException)
         {
+            // Not a name here, or a domain that cannot be asked right now.
             return null;
         }
     }
@@ -298,11 +302,15 @@ internal static class SettingsAccess
             ChangeMember(sid, add: true);
         }
 
-        // Only local users left unticked are taken out. Someone an administrator added by other
-        // means (a domain account, another group) is not in the list this was chosen from, so
-        // it stays a member.
-        var localUsers = LocalUsers().Select(TrySid).OfType<SecurityIdentifier>().ToHashSet();
-        foreach (var sid in current.Except(wanted).Where(localUsers.Contains))
+        // Only users left unticked are taken out: the local accounts and the domain or Entra ID
+        // users with a profile, which is the list this was chosen from. Someone an administrator
+        // added by other means (another group, an account that never logged on here) is not in
+        // that list, so it stays a member.
+        // A directory user whose name no longer resolves is listed by SID, and by that SID
+        // goes out as well.
+        var listed = LocalUsers().Concat(DirectoryUsersWithProfiles())
+            .Select(TrySid).OfType<SecurityIdentifier>().ToHashSet();
+        foreach (var sid in current.Except(wanted).Where(listed.Contains))
         {
             ChangeMember(sid, add: false);
         }
@@ -384,7 +392,7 @@ internal static class SettingsAccess
     // their own and inherit only that.
     internal static void SetFolderRule(string configDirectory, IEnumerable<SecurityIdentifier> users)
     {
-        MakeSafe(configDirectory);
+        var notTakenOver = MakeSafe(configDirectory);
         const InheritanceFlags inherit = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
         var security = new DirectorySecurity();
         security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
@@ -403,7 +411,20 @@ internal static class SettingsAccess
             throw new Win32Exception(Marshal.GetLastWin32Error());
         }
 
-        ResetContents(configDirectory, new RawSecurityDescriptor(rule, 0).DiscretionaryAcl!);
+        // With the restore privilege a file whose own rule would keep even an administrator
+        // out (one made so on purpose) still opens for its rule to be set. What still cannot
+        // be done is reported at the end, after everything else has been: the folder's rule
+        // stands, but the caller must not take the limiting for complete.
+        var failures = new List<string>(notTakenOver);
+        using (TokenPrivileges.Enable(TokenPrivileges.Backup, TokenPrivileges.Restore))
+        {
+            ResetContents(configDirectory, new RawSecurityDescriptor(rule, 0).DiscretionaryAcl!, failures);
+        }
+
+        if (failures.Count > 0)
+        {
+            throw new IOException($"The rule is set on the folder, but not on everything in it: {string.Join("; ", failures)}");
+        }
     }
 
     /// <summary>
@@ -414,10 +435,10 @@ internal static class SettingsAccess
     /// icacls /reset did until 10.9.3. A subfolder is held open, with no one allowed to delete
     /// or rename it, for as long as its contents are being done: its path cannot be swapped for
     /// a junction in between, the way the folder itself is held by SetFolderRule. A file
-    /// another process holds open still takes the rule; one that cannot be opened is left as
-    /// it is, and does not undo what the folder has.
+    /// another process holds open still takes the rule; one that cannot be opened or changed
+    /// is left as it is, named among the failures, and the rest is still done.
     /// </summary>
-    private static void ResetContents(string directory, RawAcl folderRule)
+    private static void ResetContents(string directory, RawAcl folderRule, List<string> failures)
     {
         foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
         {
@@ -434,6 +455,7 @@ internal static class SettingsAccess
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
             {
+                failures.Add($"{entry.FullName}: {ex.Message}");
                 continue;
             }
 
@@ -443,12 +465,13 @@ internal static class SettingsAccess
                 {
                     try
                     {
-                        ResetContents(entry.FullName, inherited);
+                        ResetContents(entry.FullName, inherited, failures);
                     }
                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
                     {
                         // What is in it keeps what it has; the folder's own rule stands, and
                         // the entries after it are still done.
+                        failures.Add($"{entry.FullName}: {ex.Message}");
                     }
                 }
             }
@@ -611,7 +634,8 @@ internal static class SettingsAccess
     /// would then set. A link, here or under it, is removed (the link only, not where it
     /// points); what someone else owns is taken over by the administrators.
     /// </summary>
-    internal static void MakeSafe(string configDirectory)
+    /// <returns>The entries that could not be looked at or taken over, for the caller to report.</returns>
+    internal static IReadOnlyList<string> MakeSafe(string configDirectory)
     {
         var folder = new DirectoryInfo(configDirectory);
         if (folder.Exists && folder.Attributes.HasFlag(FileAttributes.ReparsePoint))
@@ -620,49 +644,124 @@ internal static class SettingsAccess
         }
 
         Directory.CreateDirectory(configDirectory);
-        using (TokenPrivileges.Enable(TokenPrivileges.TakeOwnership, TokenPrivileges.Restore))
+        var failures = new List<string>();
+        // Backup for the read-only opens past any rule, take-ownership for the owner, restore
+        // for the rule later: what an administrator has, and a test run as the owner does without.
+        using (TokenPrivileges.Enable(TokenPrivileges.Backup, TokenPrivileges.TakeOwnership, TokenPrivileges.Restore))
         {
-            TakeOver(new DirectoryInfo(configDirectory));
-            TakeOverContents(configDirectory);
+            // The folder itself first, held open while its contents are done; one that became
+            // a link in the meantime is left to OpenTheFolderItself, which comes back here.
+            using var root = OpenEntryItself(configDirectory, isFolder: true, ReadControl);
+            if (root is not null)
+            {
+                TakeOver(root, isFolder: true, configDirectory);
+                TakeOverContents(configDirectory, failures);
+            }
         }
+
+        return failures;
     }
 
-    private static void TakeOverContents(string directory)
+    // Entry by entry through a handle on the entry itself, like ResetContents: a link (a
+    // junction, a symbolic link) is not followed and a hard link, a file under another name
+    // elsewhere whose owner is that file's, is not touched; both go, the name only. A folder
+    // is held open, with no one allowed to delete or rename it, while what is in it is done.
+    // One entry that cannot be looked at or taken over is named among the failures and the
+    // rest is still done; SetFolderRule reports them with its own.
+    private static void TakeOverContents(string directory, List<string> failures)
     {
         foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
         {
-            // A hard link is a file under another name elsewhere: its owner and rule are that
-            // file's, and are left alone; the name here goes.
-            if (entry.Attributes.HasFlag(FileAttributes.ReparsePoint) || (entry is FileInfo file && HasOtherNames(file.FullName)))
+            var isFolder = entry is DirectoryInfo;
+            try
             {
-                entry.Delete();
-                continue;
-            }
+                using var handle = OpenEntryItself(entry.FullName, isFolder, ReadControl);
+                if (handle is null)
+                {
+                    entry.Delete();
+                    continue;
+                }
 
-            TakeOver(entry);
-            if (entry is DirectoryInfo subdirectory)
+                TakeOver(handle, isFolder, entry.FullName);
+                if (isFolder)
+                {
+                    TakeOverContents(entry.FullName, failures);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
             {
-                TakeOverContents(subdirectory.FullName);
+                failures.Add($"{entry.FullName}: {ex.Message}");
             }
         }
     }
 
-    // Owner only: the rule itself is set afterwards, for the folder and (inherited) for the rest.
-    private static void TakeOver(FileSystemInfo entry)
+    /// <summary>
+    /// The entry under the name, opened as it is, or null (and nothing open) when it is a link
+    /// or a hard link. A folder is opened without delete sharing, to be held while its
+    /// contents are done.
+    /// </summary>
+    private static Microsoft.Win32.SafeHandles.SafeFileHandle? OpenEntryItself(string path, bool isFolder, uint access)
     {
-        switch (entry)
+        var share = isFolder ? FileShareRead | FileShareWrite : FileShareRead | FileShareWrite | FileShareDelete;
+        var handle = CreateFile(path, access, share, IntPtr.Zero,
+            OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+        if (handle.IsInvalid)
         {
-            case DirectoryInfo directory when !OwnerIsTrusted(directory.GetAccessControl(AccessControlSections.Owner)):
-                var directorySecurity = new DirectorySecurity();
-                directorySecurity.SetOwner(Administrators);
-                directory.SetAccessControl(directorySecurity);
-                break;
-            case FileInfo file when !OwnerIsTrusted(file.GetAccessControl(AccessControlSections.Owner)):
-                var fileSecurity = new FileSecurity();
-                fileSecurity.SetOwner(Administrators);
-                file.SetAccessControl(fileSecurity);
-                break;
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, $"{path} could not be opened");
         }
+
+        if (!GetFileInformationByHandle(handle, out var information))
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error);
+        }
+
+        if ((information.FileAttributes & (uint)FileAttributes.ReparsePoint) != 0 || (!isFolder && information.NumberOfLinks > 1))
+        {
+            handle.Dispose();
+            return null;
+        }
+
+        return handle;
+    }
+
+    // Owner only, through the handle: the rule itself is set afterwards, for the folder and
+    // (inherited) for the rest.
+    private static void TakeOver(Microsoft.Win32.SafeHandles.SafeFileHandle handle, bool isFolder, string path)
+    {
+        if (OwnerIsTrusted(OwnerOf(handle)))
+        {
+            return;
+        }
+
+        // The right to set the owner is asked for only now, when it is needed: an administrator
+        // has it by the take-ownership privilege, and a folder of the users' own rule, which
+        // grants no such right, still opens for the check above. The first handle stays open,
+        // so a folder cannot be swapped in between; a file that became a link is refused.
+        using var owner = OpenEntryItself(path, isFolder, ReadControl | WriteOwner)
+            ?? throw new IOException($"{path} became a link while its owner was being set.");
+        var descriptor = new RawSecurityDescriptor(ControlFlags.None, Administrators, null, null, null);
+        var bytes = new byte[descriptor.BinaryLength];
+        descriptor.GetBinaryForm(bytes, 0);
+        if (!SetKernelObjectSecurity(owner, OwnerSecurityInformation, bytes))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), $"{path} could not be taken over");
+        }
+    }
+
+    private static SecurityIdentifier? OwnerOf(Microsoft.Win32.SafeHandles.SafeFileHandle handle)
+    {
+        GetKernelObjectSecurity(handle, OwnerSecurityInformation, null, 0, out var needed);
+        var buffer = new byte[Math.Max(needed, 1u)];
+        if (!GetKernelObjectSecurity(handle, OwnerSecurityInformation, buffer, (uint)buffer.Length, out _))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        return new RawSecurityDescriptor(buffer, 0).Owner;
     }
 
     /// <summary>Whether the file has more than one name (a hard link); the handle is opened on the name itself.</summary>
@@ -684,8 +783,10 @@ internal static class SettingsAccess
     }
 
     private static bool OwnerIsTrusted(FileSystemSecurity security) =>
-        security.GetOwner(typeof(SecurityIdentifier)) is SecurityIdentifier owner
-        && (owner == LocalSystem || owner == Administrators || owner == CurrentUser.Value);
+        OwnerIsTrusted(security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier);
+
+    private static bool OwnerIsTrusted(SecurityIdentifier? owner) =>
+        owner is not null && (owner == LocalSystem || owner == Administrators || owner == CurrentUser.Value);
 
     private static readonly Lazy<SecurityIdentifier?> CurrentUser = new(() => WindowsIdentity.GetCurrent().User);
 
@@ -724,8 +825,14 @@ internal static class SettingsAccess
         }
     }
 
+    // A name (bare for a local account, DOMAIN\user otherwise) or a SID as text, which is how
+    // a directory user whose name no longer resolves is listed. A name that does not resolve
+    // throws: a user asked for on the command line must not be dropped in silence, and
+    // RestrictTo resolves every name before it changes anything.
     private static SecurityIdentifier Sid(string user) =>
-        (SecurityIdentifier)new NTAccount(user.Contains('\\') ? user : $"{Environment.MachineName}\\{user}").Translate(typeof(SecurityIdentifier));
+        user.StartsWith("S-1-", StringComparison.Ordinal)
+            ? new SecurityIdentifier(user)
+            : (SecurityIdentifier)new NTAccount(user.Contains('\\') ? user : $"{Environment.MachineName}\\{user}").Translate(typeof(SecurityIdentifier));
 
     private static void ChangeMember(SecurityIdentifier sid, bool add)
     {
@@ -780,12 +887,14 @@ internal static class SettingsAccess
     private const uint FileReadAttributes = 0x00000080;
     private const uint ReadControl = 0x00020000;
     private const uint WriteDac = 0x00040000;
+    private const uint WriteOwner = 0x00080000;
     private const uint FileShareRead = 0x1;
     private const uint FileShareWrite = 0x2;
     private const uint FileShareDelete = 0x4;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const uint OwnerSecurityInformation = 0x1;
     private const uint DaclSecurityInformation = 0x4;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -799,6 +908,9 @@ internal static class SettingsAccess
     // propagated to what is in the folder here, ResetContents does that afterwards.
     [DllImport("advapi32.dll", SetLastError = true)]
     private static extern bool SetKernelObjectSecurity(Microsoft.Win32.SafeHandles.SafeFileHandle handle, uint information, byte[] descriptor);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetKernelObjectSecurity(Microsoft.Win32.SafeHandles.SafeFileHandle handle, uint information, byte[]? descriptor, uint length, out uint needed);
 
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     private struct ByHandleFileInformation
