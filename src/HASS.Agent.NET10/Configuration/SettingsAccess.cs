@@ -5,6 +5,7 @@ using System.Security.AccessControl;
 using System.Security.Principal;
 using HASS.Agent.Companion.Runtime;
 using HASS.Agent.Companion.Security;
+using Microsoft.Win32;
 
 namespace HASS.Agent.Companion.Configuration;
 
@@ -106,9 +107,105 @@ internal static class SettingsAccess
     }
 
     /// <summary>
-    /// The local users who are not administrators. While there are none, limiting the settings
-    /// to the users of the PC takes nothing from anyone, so an update does it without asking.
+    /// The users who have logged on to this PC with an account that is not a local one: from a
+    /// domain, or from Entra ID (a work PC). They are known from their profiles, since the local
+    /// account list does not have them, and whether they are administrators is not known either.
+    /// Named as DOMAIN\user when Windows can name them, and by their SID when it cannot.
     /// </summary>
+    public static IReadOnlyList<string> DirectoryUsersWithProfiles()
+    {
+        var users = new List<string>();
+        using var profiles = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList");
+        if (profiles is null)
+        {
+            return users;
+        }
+
+        foreach (var name in profiles.GetSubKeyNames())
+        {
+            if (!IsDirectoryAccount(name))
+            {
+                continue;
+            }
+
+            try
+            {
+                users.Add(new SecurityIdentifier(name).Translate(typeof(NTAccount)).Value);
+            }
+            catch (Exception ex) when (ex is IdentityNotMappedException or SystemException)
+            {
+                users.Add(name);
+            }
+        }
+
+        return users.Order(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    /// <summary>
+    /// A domain account (S-1-5-21-…, with a domain other than this PC's) or an Entra ID one
+    /// (S-1-12-1-…). A deleted local account's leftover profile is neither.
+    /// </summary>
+    internal static bool IsDirectoryAccount(string sid, SecurityIdentifier? machine = null)
+    {
+        if (sid.StartsWith("S-1-12-1-", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (!sid.StartsWith("S-1-5-21-", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        machine ??= MachineSid.Value;
+        SecurityIdentifier parsed;
+        try
+        {
+            parsed = new SecurityIdentifier(sid);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+
+        // The PC's own SID unknown: a domain account cannot be told from a local one, and an
+        // update must not take an unknown one for a local administrator.
+        return machine is null || parsed.AccountDomainSid != machine;
+    }
+
+    // The SID of the PC itself, the domain part of every local account's SID. Looked up by the
+    // PC's name; failing that, from a local account.
+    private static readonly Lazy<SecurityIdentifier?> MachineSid = new(FindMachineSid);
+
+    private static SecurityIdentifier? FindMachineSid()
+    {
+        try
+        {
+            var sid = (SecurityIdentifier)new NTAccount(Environment.MachineName).Translate(typeof(SecurityIdentifier));
+            return sid.AccountDomainSid ?? sid;
+        }
+        catch (Exception ex) when (ex is IdentityNotMappedException or SystemException)
+        {
+        }
+
+        if (string.Equals(Environment.UserDomainName, Environment.MachineName, StringComparison.OrdinalIgnoreCase))
+        {
+            return CurrentUser.Value?.AccountDomainSid;
+        }
+
+        return LocalUsers().Select(TrySid).OfType<SecurityIdentifier>().FirstOrDefault()?.AccountDomainSid;
+    }
+
+    /// <summary>
+    /// Everyone the settings should not be limited to without asking: the local users who are
+    /// not administrators, and the users from a domain or Entra ID, whom the local list does
+    /// not know. While there are none, limiting the settings to the users of the PC takes
+    /// nothing from anyone, so an update does it without asking.
+    /// </summary>
+    public static IReadOnlyList<string> UsersNotKnownToBeAdministrators() =>
+        NonAdministratorUsers().Concat(DirectoryUsersWithProfiles()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+    /// <summary>The local users who are not administrators.</summary>
     public static IReadOnlyList<string> NonAdministratorUsers()
     {
         // The group's name depends on the language of Windows ("Rendszergazdák"): looked up by its SID.
@@ -155,7 +252,7 @@ internal static class SettingsAccess
         }
     }
 
-    /// <summary>The members of the group, by name; empty when there is no group.</summary>
+    /// <summary>The members of the group, as DOMAIN\name (the PC's name for a local account); empty when there is no group.</summary>
     public static IReadOnlySet<string> Members()
     {
         var members = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -171,8 +268,10 @@ internal static class SettingsAccess
             for (var index = 0; index < read; index++)
             {
                 var info = Marshal.PtrToStructure<LocalGroupMembersInfo3>(buffer + index * size);
-                var name = info.DomainAndName ?? string.Empty;
-                members.Add(name[(name.LastIndexOf('\\') + 1)..]);
+                if (!string.IsNullOrEmpty(info.DomainAndName))
+                {
+                    members.Add(info.DomainAndName);
+                }
             }
         }
         finally
@@ -246,7 +345,7 @@ internal static class SettingsAccess
         }
 
         var users = LocalUsers();
-        switch (OnUpdate(restricted: false, users.Count, NonAdministratorUsers().Count))
+        switch (OnUpdate(restricted: false, users.Count, NonAdministratorUsers().Count, DirectoryUsersWithProfiles().Count))
         {
             case UpdateAction.LimitToTheUsers:
                 RestrictTo(configDirectory, users);
@@ -267,13 +366,15 @@ internal static class SettingsAccess
     /// <summary>
     /// What an update does with the folder. A limited one stays as it is. One open to every
     /// user on a PC whose users are all administrators is limited to them: it changes nothing
-    /// for anyone today and keeps out a user added later. Otherwise the choice is someone's to
-    /// make (the app asks when its window is opened, and Home Assistant is told), and the folder
-    /// gets the rule every install had.
+    /// for anyone today and keeps out a user added later. Otherwise, and on a PC where someone
+    /// from a domain or Entra ID has logged on (not a local account, so not in the list, and
+    /// not known to be an administrator), the choice is someone's to make (the app asks when
+    /// its window is opened, and Home Assistant is told), and the folder gets the rule every
+    /// install had.
     /// </summary>
-    internal static UpdateAction OnUpdate(bool restricted, int users, int nonAdministrators) =>
+    internal static UpdateAction OnUpdate(bool restricted, int users, int nonAdministrators, int directoryUsers) =>
         restricted ? UpdateAction.LeaveAsItIs
-        : users > 0 && nonAdministrators == 0 ? UpdateAction.LimitToTheUsers
+        : users > 0 && nonAdministrators == 0 && directoryUsers == 0 ? UpdateAction.LimitToTheUsers
         : UpdateAction.OpenToEveryone;
 
     // Exactly this on the folder: SYSTEM and administrators full control, nothing inherited
@@ -295,19 +396,164 @@ internal static class SettingsAccess
             security.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.Modify | FileSystemRights.Synchronize, inherit, PropagationFlags.InheritOnly, AccessControlType.Allow));
         }
 
+        var rule = security.GetSecurityDescriptorBinaryForm();
         using var folder = OpenTheFolderItself(configDirectory);
-        if (!SetKernelObjectSecurity(folder, DaclSecurityInformation, security.GetSecurityDescriptorBinaryForm()))
+        if (!SetKernelObjectSecurity(folder, DaclSecurityInformation, rule))
         {
             throw new Win32Exception(Marshal.GetLastWin32Error());
         }
 
-        if (Directory.EnumerateFileSystemEntries(configDirectory).Any())
+        ResetContents(configDirectory, new RawSecurityDescriptor(rule, 0).DiscretionaryAcl!);
+    }
+
+    /// <summary>
+    /// What is in the folder loses any rule of its own and gets the folder's, inherited, entry
+    /// by entry through a handle opened on the entry itself. A link made since MakeSafe is
+    /// removed, not followed; so is a file that has another name elsewhere (a hard link), since
+    /// a rule set on it here would be the rule of that other file too, which is what
+    /// icacls /reset did until 10.9.3. A subfolder is held open, with no one allowed to delete
+    /// or rename it, for as long as its contents are being done: its path cannot be swapped for
+    /// a junction in between, the way the folder itself is held by SetFolderRule. A file
+    /// another process holds open still takes the rule; one that cannot be opened is left as
+    /// it is, and does not undo what the folder has.
+    /// </summary>
+    private static void ResetContents(string directory, RawAcl folderRule)
+    {
+        foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
         {
-            // A file another process holds open still takes the new rule; one that cannot is
-            // reported but does not undo what the folder already has. /L: a link made since
-            // MakeSafe is changed itself, never what it points to.
-            Icacls($"\"{Path.Combine(configDirectory, "*")}\" /reset /T /C /L", mustSucceed: false);
+            var isFolder = entry is DirectoryInfo;
+            var inherited = InheritedFrom(folderRule, isFolder);
+            Microsoft.Win32.SafeHandles.SafeFileHandle? held;
+            try
+            {
+                if (!TryResetEntry(entry.FullName, isFolder, inherited, out held))
+                {
+                    entry.Delete();
+                    continue;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
+            {
+                continue;
+            }
+
+            using (held)
+            {
+                if (isFolder)
+                {
+                    try
+                    {
+                        ResetContents(entry.FullName, inherited);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception)
+                    {
+                        // What is in it keeps what it has; the folder's own rule stands, and
+                        // the entries after it are still done.
+                    }
+                }
+            }
         }
+    }
+
+    /// <summary>
+    /// False when the entry is a link or a hard link: to be removed, not changed. A folder's
+    /// handle is handed back open, to be held while its contents are done.
+    /// </summary>
+    private static bool TryResetEntry(string path, bool isFolder, RawAcl inherited, out Microsoft.Win32.SafeHandles.SafeFileHandle? held)
+    {
+        held = null;
+        var share = isFolder ? FileShareRead | FileShareWrite : FileShareRead | FileShareWrite | FileShareDelete;
+        var handle = CreateFile(path, ReadControl | WriteDac, share, IntPtr.Zero,
+            OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, $"{path} could not be opened");
+        }
+
+        if (!GetFileInformationByHandle(handle, out var information))
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error);
+        }
+
+        if ((information.FileAttributes & (uint)FileAttributes.ReparsePoint) != 0 || (!isFolder && information.NumberOfLinks > 1))
+        {
+            handle.Dispose();
+            return false;
+        }
+
+        // Not protected, so the folder's rule keeps flowing to it later; what the kernel is
+        // handed is the rule as inherited, since it propagates nothing on its own.
+        var descriptor = new CommonSecurityDescriptor(
+            isFolder, false, ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclAutoInherited,
+            null, null, null, new DiscretionaryAcl(isFolder, false, inherited));
+        var bytes = new byte[descriptor.BinaryLength];
+        descriptor.GetBinaryForm(bytes, 0);
+        if (!SetKernelObjectSecurity(handle, DaclSecurityInformation, bytes))
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, $"{path} did not take the rule");
+        }
+
+        if (isFolder)
+        {
+            held = handle;
+        }
+        else
+        {
+            handle.Dispose();
+        }
+
+        return true;
+    }
+
+    /// <summary>The rule a folder passes on to a folder or a file in it, as Windows would inherit it.</summary>
+    internal static RawAcl InheritedFrom(RawAcl folderRule, bool toFolder)
+    {
+        var acl = new RawAcl(folderRule.Revision, folderRule.Count);
+        foreach (var ace in folderRule.OfType<CommonAce>())
+        {
+            var flags = ace.AceFlags;
+            var toFolders = flags.HasFlag(AceFlags.ContainerInherit);
+            var toFiles = flags.HasFlag(AceFlags.ObjectInherit);
+            AceFlags inherited;
+            if (toFolder)
+            {
+                if (!toFolders && !toFiles)
+                {
+                    continue;
+                }
+
+                // Applies to the folder when meant for folders; passed on unless told not to.
+                inherited = AceFlags.Inherited;
+                if (!flags.HasFlag(AceFlags.NoPropagateInherit))
+                {
+                    inherited |= flags & (AceFlags.ContainerInherit | AceFlags.ObjectInherit);
+                }
+
+                if (!toFolders)
+                {
+                    inherited |= AceFlags.InheritOnly;
+                }
+            }
+            else
+            {
+                if (!toFiles)
+                {
+                    continue;
+                }
+
+                inherited = AceFlags.Inherited;
+            }
+
+            acl.InsertAce(acl.Count, new CommonAce(inherited, ace.AceQualifier, ace.AccessMask, ace.SecurityIdentifier, ace.IsCallback, ace.GetOpaque()));
+        }
+
+        return acl;
     }
 
     /// <summary>
@@ -385,7 +631,9 @@ internal static class SettingsAccess
     {
         foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
         {
-            if (entry.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            // A hard link is a file under another name elsewhere: its owner and rule are that
+            // file's, and are left alone; the name here goes.
+            if (entry.Attributes.HasFlag(FileAttributes.ReparsePoint) || (entry is FileInfo file && HasOtherNames(file.FullName)))
             {
                 entry.Delete();
                 continue;
@@ -417,6 +665,24 @@ internal static class SettingsAccess
         }
     }
 
+    /// <summary>Whether the file has more than one name (a hard link); the handle is opened on the name itself.</summary>
+    internal static bool HasOtherNames(string path)
+    {
+        using var handle = CreateFile(path, FileReadAttributes, FileShareRead | FileShareWrite | FileShareDelete, IntPtr.Zero,
+            OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), $"{path} could not be opened");
+        }
+
+        if (!GetFileInformationByHandle(handle, out var information))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        return information.NumberOfLinks > 1;
+    }
+
     private static bool OwnerIsTrusted(FileSystemSecurity security) =>
         security.GetOwner(typeof(SecurityIdentifier)) is SecurityIdentifier owner
         && (owner == LocalSystem || owner == Administrators || owner == CurrentUser.Value);
@@ -433,25 +699,6 @@ internal static class SettingsAccess
             .Where(sid => sid != LocalSystem && sid != Administrators)
             .Distinct()
             .ToList();
-
-    private static void Icacls(string arguments, bool mustSucceed = true)
-    {
-        using var process = Process.Start(new ProcessStartInfo
-        {
-            FileName = SystemTools.InSystem32("icacls.exe"),
-            Arguments = arguments,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        }) ?? throw new InvalidOperationException("icacls.exe did not start.");
-        var output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
-        process.WaitForExit();
-        if (mustSucceed && process.ExitCode != 0)
-        {
-            throw new InvalidOperationException($"icacls {arguments} failed ({process.ExitCode}): {output.Trim()}");
-        }
-    }
 
     private static SecurityIdentifier EnsureGroup()
     {
@@ -530,10 +777,12 @@ internal static class SettingsAccess
     [DllImport("netapi32.dll")]
     private static extern int NetApiBufferFree(IntPtr buffer);
 
+    private const uint FileReadAttributes = 0x00000080;
     private const uint ReadControl = 0x00020000;
     private const uint WriteDac = 0x00040000;
     private const uint FileShareRead = 0x1;
     private const uint FileShareWrite = 0x2;
+    private const uint FileShareDelete = 0x4;
     private const uint OpenExisting = 3;
     private const uint FileFlagBackupSemantics = 0x02000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
@@ -547,7 +796,7 @@ internal static class SettingsAccess
     private static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file, out ByHandleFileInformation information);
 
     // The descriptor carries the "protected" flag set by SetAccessRuleProtection; nothing is
-    // propagated to what is in the folder here, icacls does that afterwards.
+    // propagated to what is in the folder here, ResetContents does that afterwards.
     [DllImport("advapi32.dll", SetLastError = true)]
     private static extern bool SetKernelObjectSecurity(Microsoft.Win32.SafeHandles.SafeFileHandle handle, uint information, byte[] descriptor);
 

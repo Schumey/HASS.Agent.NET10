@@ -268,14 +268,162 @@ public class SettingsTests
     }
 
     [Fact]
-    public void Normalized_settings_always_have_an_api_key_and_a_serial_number()
+    public void Normalized_settings_always_have_a_serial_number()
     {
-        var settings = new CompanionSettings { ApiKey = "", SerialNumber = " " };
+        var settings = new CompanionSettings { SerialNumber = " " };
 
         settings.Normalize();
 
-        Assert.Matches("^[0-9a-f]{32}$", settings.ApiKey);
         Assert.Matches("^[0-9a-f]{32}$", settings.SerialNumber);
+    }
+
+    [Fact]
+    public void A_sensor_key_of_before_is_read_as_the_renamed_one()
+    {
+        var settings = new CompanionSettings
+        {
+            BuiltInSensors =
+            [
+                new BuiltInSensorSetting { Key = "system_drive_free_gb", Service = false, TrayApp = true, PollingProfile = "hourly" },
+                new BuiltInSensorSetting { Key = "memory_available_mb", Service = false, TrayApp = false },
+            ],
+            CustomSensors =
+            [
+                new CustomSensorDefinition { Id = "a", Name = "Drive size", Type = CustomSensorTypes.BuiltInAttribute, Parameter = "system_drive_free_gb.total_gb", Service = true },
+                new CustomSensorDefinition { Id = "b", Name = "Free", Type = CustomSensorTypes.BuiltInAttribute, Parameter = "memory_available_mb", Service = true },
+            ]
+        };
+
+        settings.Normalize();
+
+        var drive = Assert.Single(settings.BuiltInSensors, sensor => sensor.Key == "system_drive");
+        Assert.True(drive.TrayApp);
+        Assert.False(drive.Service);
+        Assert.Equal("hourly", drive.PollingProfile);
+        var memory = Assert.Single(settings.BuiltInSensors, sensor => sensor.Key == "memory_available");
+        Assert.False(memory.TrayApp);
+        Assert.DoesNotContain(settings.BuiltInSensors, sensor => sensor.Key is "system_drive_free_gb" or "memory_available_mb");
+        Assert.Equal("system_drive.total_gb", settings.CustomSensors[0].Parameter);
+        Assert.Equal("memory_available", settings.CustomSensors[1].Parameter);
+    }
+
+    [Fact]
+    public void The_metrics_payload_carries_a_renamed_sensor_under_both_keys()
+    {
+        // The record has many fields; built with defaults, the two that matter set.
+        var constructor = typeof(SystemMetricsMessage).GetConstructors().Single();
+        var arguments = constructor.GetParameters()
+            .Select(parameter => parameter.Name switch
+            {
+                "MemoryAvailableMb" => (object)6262L,
+                "SystemDriveFreeGb" => 295.4,
+                "Attributes" => new Dictionary<string, IReadOnlyDictionary<string, object?>>(),
+                _ => parameter.ParameterType.IsValueType ? Activator.CreateInstance(parameter.ParameterType) : null
+            })
+            .ToArray();
+        var message = (SystemMetricsMessage)constructor.Invoke(arguments);
+
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(message));
+
+        var root = json.RootElement;
+        Assert.Equal(6262, root.GetProperty("memory_available").GetInt64());
+        Assert.Equal(6262, root.GetProperty("memory_available_mb").GetInt64());
+        Assert.Equal(295.4, root.GetProperty("system_drive").GetDouble());
+        Assert.Equal(295.4, root.GetProperty("system_drive_free_gb").GetDouble());
+    }
+
+    [Fact]
+    public void The_catalog_knows_the_keys_of_before_but_does_not_list_them()
+    {
+        Assert.Equal("system_drive", BuiltInSensorCatalog.CurrentKey("system_drive_free_gb"));
+        Assert.Equal("cpu_usage", BuiltInSensorCatalog.CurrentKey("cpu_usage"));
+        Assert.Equal("memory_available_mb", BuiltInSensorCatalog.FormerKey("memory_available"));
+        Assert.Null(BuiltInSensorCatalog.FormerKey("cpu_usage"));
+        Assert.Equal("system_drive", BuiltInSensorCatalog.Find("system_drive_free_gb")?.Key);
+        Assert.All(BuiltInSensorCatalog.RenamedKeys, pair =>
+        {
+            Assert.DoesNotContain(pair.Key, BuiltInSensorCatalog.AllKeys);
+            Assert.Contains(pair.Value, BuiltInSensorCatalog.AllKeys);
+        });
+    }
+
+    [Fact]
+    public void Local_api_is_off_by_default_and_has_no_key_while_off()
+    {
+        var settings = new CompanionSettings { ApiKey = "0123456789abcdef0123456789abcdef" };
+
+        settings.Normalize();
+
+        Assert.False(settings.LocalApiEnabled);
+        Assert.Equal(string.Empty, settings.ApiKey);
+    }
+
+    [Theory]
+    [InlineData("""{"deviceName":"PC","apiKey":"0123456789abcdef0123456789abcdef"}""", true, "0123456789abcdef0123456789abcdef")]  // before 10.9.3: always on
+    [InlineData("""{"deviceName":"PC","apiKey":""}""", false, "")]                                                                   // before 10.9.3, no key yet: nothing to keep
+    [InlineData("""{"deviceName":"PC","localApiEnabled":false,"apiKey":"0123456789abcdef0123456789abcdef"}""", false, "")]          // this version, turned off
+    [InlineData("""{"deviceName":"PC","localApiEnabled":true,"apiKey":"0123456789abcdef0123456789abcdef"}""", true, "0123456789abcdef0123456789abcdef")]
+    public void A_settings_file_from_before_the_switch_keeps_the_local_api_on(string json, bool expectedOn, string expectedKey)
+    {
+        var settings = JsonSerializer.Deserialize<CompanionSettings>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
+
+        var kept = SettingsStore.KeepLocalApiOnFromOlderFile(json, settings);
+        settings.Normalize();
+
+        Assert.Equal(expectedOn && !json.Contains("localApiEnabled"), kept);
+        Assert.Equal(expectedOn, settings.LocalApiEnabled);
+        Assert.Equal(expectedKey, settings.ApiKey);
+    }
+
+    [Fact]
+    public void Turning_the_local_api_on_makes_a_key_and_keeps_it()
+    {
+        var settings = new CompanionSettings { LocalApiEnabled = true };
+
+        settings.Normalize();
+        var key = settings.ApiKey;
+        settings.Normalize();
+
+        Assert.Matches("^[0-9a-f]{32}$", key);
+        Assert.Equal(key, settings.ApiKey);
+    }
+
+    [Fact]
+    public void Export_leaves_every_secret_out_and_import_makes_a_new_key()
+    {
+        var settings = new CompanionSettings
+        {
+            DeviceName = "PC-1", LocalApiEnabled = true, MqttUsername = "ha",
+            LibreHardwareMonitorUser = "lhm"
+        };
+        settings.Normalize();
+        settings.SetMqttPassword("secret-mqtt");
+        settings.SetHaApiToken("secret-token");
+        settings.SetLibreHardwareMonitorPassword("secret-lhm");
+        var keyBefore = settings.ApiKey;
+
+        var json = SettingsStore.ExportJson(settings);
+
+        Assert.DoesNotContain("secret-", json);
+        Assert.DoesNotContain(keyBefore, json);
+        using (var document = JsonDocument.Parse(json))
+        {
+            foreach (var secret in SettingsStore.SecretsLeftOutOfExport)
+            {
+                Assert.False(document.RootElement.TryGetProperty(secret, out _), secret);
+            }
+
+            Assert.Equal("PC-1", document.RootElement.GetProperty("deviceName").GetString());
+            Assert.Equal("ha", document.RootElement.GetProperty("mqttUsername").GetString());
+            Assert.Equal("lhm", document.RootElement.GetProperty("libreHardwareMonitorUser").GetString());
+        }
+
+        var imported = JsonSerializer.Deserialize<CompanionSettings>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
+        imported.Normalize();
+        Assert.True(imported.LocalApiEnabled);
+        Assert.Matches("^[0-9a-f]{32}$", imported.ApiKey);
+        Assert.NotEqual(keyBefore, imported.ApiKey);
+        Assert.Equal(string.Empty, imported.GetLibreHardwareMonitorPassword());
     }
 
     [Theory]

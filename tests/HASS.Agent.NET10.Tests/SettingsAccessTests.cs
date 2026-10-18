@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using HASS.Agent.Companion.Configuration;
@@ -130,6 +131,67 @@ public class SettingsAccessTests : IDisposable
     }
 
     [Fact]
+    public void A_hard_link_in_the_folder_is_removed_and_the_file_it_names_keeps_its_rule()
+    {
+        // The other name of a file elsewhere: a rule set through the link would be that file's
+        // rule too, which is how a user could have had the folder's rule put on a file of their
+        // choosing. Hard links need no privilege, only the same volume (both under %TEMP%).
+        var outside = Directory.CreateTempSubdirectory("hass-agent-outside-").FullName;
+        try
+        {
+            var target = Path.Combine(outside, "target.txt");
+            File.WriteAllText(target, "x");
+            var before = new FileInfo(target).GetAccessControl().GetSecurityDescriptorSddlForm(AccessControlSections.Access);
+            var link = Path.Combine(_folder, "settings.json");
+            Assert.True(CreateHardLink(link, target, IntPtr.Zero), $"CreateHardLink failed: {Marshal.GetLastWin32Error()}");
+            Assert.True(SettingsAccess.HasOtherNames(link));
+            Assert.True(SettingsAccess.HasOtherNames(target)); // the same file, seen from its other name
+            File.WriteAllText(Path.Combine(_folder, "plain.txt"), "y");
+
+            SettingsAccess.SetFolderRule(_folder, [Me]);
+
+            Assert.False(File.Exists(link));
+            Assert.True(File.Exists(target));
+            Assert.Equal(before, new FileInfo(target).GetAccessControl().GetSecurityDescriptorSddlForm(AccessControlSections.Access));
+            Assert.False(SettingsAccess.HasOtherNames(target));
+            // The ordinary file next to it took the rule.
+            var plain = new FileInfo(Path.Combine(_folder, "plain.txt")).GetAccessControl();
+            Assert.False(plain.AreAccessRulesProtected);
+            Assert.All(plain.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<FileSystemAccessRule>(), rule => Assert.True(rule.IsInherited));
+        }
+        finally
+        {
+            Directory.Delete(outside, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void The_rule_a_folder_passes_on_is_what_windows_would_inherit()
+    {
+        var security = new DirectorySecurity();
+        var system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+        const InheritanceFlags both = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+        security.AddAccessRule(new FileSystemAccessRule(system, FileSystemRights.FullControl, both, PropagationFlags.None, AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(Me, SettingsAccess.UsersOnTheFolder, InheritanceFlags.None, PropagationFlags.None, AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(Me, FileSystemRights.Modify | FileSystemRights.Synchronize, both, PropagationFlags.InheritOnly, AccessControlType.Allow));
+        var folderRule = new RawSecurityDescriptor(security.GetSecurityDescriptorBinaryForm(), 0).DiscretionaryAcl!;
+
+        var toFolder = SettingsAccess.InheritedFrom(folderRule, toFolder: true).Cast<CommonAce>().ToList();
+        var toFile = SettingsAccess.InheritedFrom(folderRule, toFolder: false).Cast<CommonAce>().ToList();
+
+        // The folder-only rule is not passed on; the rest arrives marked inherited, a subfolder
+        // keeps passing it on, a file gets it flat.
+        Assert.Equal(2, toFolder.Count);
+        Assert.All(toFolder, ace => Assert.Equal(AceFlags.Inherited | AceFlags.ContainerInherit | AceFlags.ObjectInherit, ace.AceFlags));
+        Assert.Equal(2, toFile.Count);
+        Assert.All(toFile, ace => Assert.Equal(AceFlags.Inherited, ace.AceFlags));
+        Assert.Contains(toFile, ace => ace.SecurityIdentifier == Me && (FileSystemRights)ace.AccessMask == (FileSystemRights.Modify | FileSystemRights.Synchronize));
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateHardLink(string fileName, string existingFileName, IntPtr securityAttributes);
+
+    [Fact]
     public void Files_already_there_take_the_folder_rule()
     {
         var file = Path.Combine(_folder, "settings.json");
@@ -158,15 +220,50 @@ public class SettingsAccessTests : IDisposable
     // What an update decides, without doing it: doing it on an open folder would create the
     // local group and change its members on the machine that runs the tests.
     [Theory]
-    [InlineData(true, 3, 1, "LeaveAsItIs")]       // already limited
-    [InlineData(true, 1, 0, "LeaveAsItIs")]
-    [InlineData(false, 1, 0, "LimitToTheUsers")]  // administrators only
-    [InlineData(false, 2, 0, "LimitToTheUsers")]
-    [InlineData(false, 2, 1, "OpenToEveryone")]   // someone else's choice
-    [InlineData(false, 0, 0, "OpenToEveryone")]   // no users found: as before
-    public void What_an_update_does_with_the_folder(bool restricted, int users, int nonAdministrators, string expected)
+    [InlineData(true, 3, 1, 0, "LeaveAsItIs")]       // already limited
+    [InlineData(true, 1, 0, 0, "LeaveAsItIs")]
+    [InlineData(false, 1, 0, 0, "LimitToTheUsers")]  // administrators only
+    [InlineData(false, 2, 0, 0, "LimitToTheUsers")]
+    [InlineData(false, 2, 1, 0, "OpenToEveryone")]   // someone else's choice
+    [InlineData(false, 0, 0, 0, "OpenToEveryone")]   // no users found: as before
+    [InlineData(false, 1, 0, 1, "OpenToEveryone")]   // a domain or Entra user has logged on: not known to be an administrator
+    public void What_an_update_does_with_the_folder(bool restricted, int users, int nonAdministrators, int directoryUsers, string expected)
     {
-        Assert.Equal(expected, SettingsAccess.OnUpdate(restricted, users, nonAdministrators).ToString());
+        Assert.Equal(expected, SettingsAccess.OnUpdate(restricted, users, nonAdministrators, directoryUsers).ToString());
+    }
+
+    [Theory]
+    [InlineData("S-1-5-21-1111-2222-3333-1001", false)]   // this PC's own account
+    [InlineData("S-1-5-21-1111-2222-3333-500", false)]
+    [InlineData("S-1-5-21-9999-8888-7777-1105", true)]    // a domain account
+    [InlineData("S-1-12-1-123-456-789-1011", true)]       // an Entra ID account
+    [InlineData("S-1-5-18", false)]                       // SYSTEM and the service accounts have profiles too
+    [InlineData("S-1-5-19", false)]
+    [InlineData("S-1-5-20", false)]
+    [InlineData("not-a-sid", false)]
+    public void A_profile_from_a_domain_or_entra_is_told_from_a_local_one(string sid, bool expected)
+    {
+        var machine = new SecurityIdentifier("S-1-5-21-1111-2222-3333");
+
+        Assert.Equal(expected, SettingsAccess.IsDirectoryAccount(sid, machine));
+    }
+
+    [Fact]
+    public void Without_the_machine_sid_a_domain_shaped_profile_counts_as_not_local()
+    {
+        Assert.True(SettingsAccess.IsDirectoryAccount("S-1-5-21-1111-2222-3333-1001", machine: new SecurityIdentifier("S-1-5-21-4-5-6")));
+    }
+
+    [Fact]
+    public void The_profiles_of_this_pc_can_be_listed()
+    {
+        // Whatever this PC has: the call works, and a local account never shows up as a directory one.
+        var users = SettingsAccess.DirectoryUsersWithProfiles();
+
+        if (string.Equals(Environment.UserDomainName, Environment.MachineName, StringComparison.OrdinalIgnoreCase))
+        {
+            Assert.DoesNotContain(users, user => user.EndsWith("\\" + Environment.UserName, StringComparison.OrdinalIgnoreCase));
+        }
     }
 
     [Fact]
@@ -198,6 +295,11 @@ public class SettingsAccessTests : IDisposable
     [Fact]
     public void Local_users_include_the_one_running_this()
     {
+        // The list is of local accounts; one from a domain or Entra ID is not in it by design.
+        Assert.SkipUnless(
+            string.Equals(Environment.UserDomainName, Environment.MachineName, StringComparison.OrdinalIgnoreCase),
+            "The account running the tests is not a local one.");
+
         Assert.Contains(Environment.UserName, SettingsAccess.LocalUsers(), StringComparer.OrdinalIgnoreCase);
     }
 }

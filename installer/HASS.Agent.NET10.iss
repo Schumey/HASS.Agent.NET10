@@ -1,5 +1,5 @@
 ﻿#ifndef MyAppVersion
-#define MyAppVersion "10.9.3-beta.5"
+#define MyAppVersion "10.9.3-beta.6"
 #endif
 
 ; The file version resource takes numbers only: a pre-release ("10.9.0-beta.1") keeps its
@@ -62,6 +62,8 @@ english.TaskGroupAccess=Who will use HASS.Agent on this PC? (its settings hold t
 english.TaskAccessMe=Only me
 english.TaskAccessAll=Every user of this PC
 english.UninstallSettings=Remove the settings too?%n%nThey hold the Home Assistant token, the MQTT password and the API key. Keep them only if you will install HASS.Agent .NET10 again.
+english.AccessUserUnknown=Setup could not find out which user started it, so HASS.Agent .NET10 was limited to %1 only.%n%nIf that is not you, an administrator can add you in HASS.Agent: Danger Zone, Users of this PC.
+english.AccessFailed=HASS.Agent .NET10 could not be limited to the chosen users; every user of this PC can use it for now.%n%nIt can be set in HASS.Agent: Danger Zone, Users of this PC.
 
 hungarian.TaskAutostart=Automatikus indítás bejelentkezéskor
 hungarian.TaskGroupStartup=Indítás:
@@ -74,6 +76,8 @@ hungarian.TaskGroupAccess=Ki fogja használni a HASS.Agentet ezen a gépen? (a b
 hungarian.TaskAccessMe=Csak én
 hungarian.TaskAccessAll=A gép minden felhasználója
 hungarian.UninstallSettings=A beállításokat is törlöd?%n%nBennük van a Home Assistant token, az MQTT jelszó és az API kulcs. Csak akkor tartsd meg őket, ha újra telepíted a HASS.Agent .NET10-et.
+hungarian.AccessUserUnknown=A telepítő nem tudta megállapítani, melyik felhasználó indította, ezért a HASS.Agent .NET10 csak %1 számára lett korlátozva.%n%nHa ez nem te vagy, egy rendszergazda felvehet a HASS.Agentben: Danger Zone, A gép felhasználói.
+hungarian.AccessFailed=A HASS.Agent .NET10-et nem sikerült a választott felhasználókra korlátozni; egyelőre a gép minden felhasználója használhatja.%n%nA HASS.Agentben beállítható: Danger Zone, A gép felhasználói.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -139,8 +143,34 @@ begin
   Result := ReadPreviousVersion() = '';
 end;
 
-{ The user logged on to the PC who started Setup. Setup itself may run as another account,
-  an administrator whose password was typed in; that account is added too, below. }
+{ Secur32's GetUserNameEx: the account of this process's own token, as DOMAIN\name
+  (NameSamCompatible = 2), in Unicode. }
+function GetUserNameExW(NameFormat: Integer; NameBuffer: String; var Size: DWORD): Boolean;
+  external 'GetUserNameExW@secur32.dll stdcall';
+
+{ The account Setup runs as, as DOMAIN\name: the user, or an administrator whose password
+  was typed in. From Setup's own token, so the domain and the name are the same account's
+  (the environment may still be the user's after an elevation with other credentials), and
+  an accent in the name survives; whoami's redirected output would be in the OEM code page. }
+function SetupUserName(): string;
+var
+  Buffer: String;
+  Size: DWORD;
+begin
+  Size := 512;
+  SetLength(Buffer, Size);
+  if GetUserNameExW(2, Buffer, Size) and (Size > 0) then
+    Result := Copy(Buffer, 1, Size)
+  else
+    Result := ExpandConstant('{username}');
+end;
+
+{ The user logged on to the PC who started Setup, as DOMAIN\name. Written by that user into
+  ProgramData, where every user may create a file (Setup's own temp folder is the elevated
+  account's, where another user cannot write, which is exactly the case this is for), under a
+  name made up for this run, so nobody can put a file of that name there first; read only when
+  the user's own write succeeded. PowerShell writes it in the ANSI code page, which is what
+  LoadStringsFromFile reads, so an accent in the name survives. }
 function OriginalUserName(): string;
 var
   NameFile: string;
@@ -148,17 +178,23 @@ var
   ResultCode: Integer;
 begin
   Result := '';
-  NameFile := ExpandConstant('{tmp}\hass-agent-user.txt');
-  if ExecAsOriginalUser(ExpandConstant('{cmd}'), '/C echo %USERNAME%>"' + NameFile + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
-    and LoadStringsFromFile(NameFile, Lines) and (GetArrayLength(Lines) > 0) then
+  NameFile := ExpandConstant('{commonappdata}\hass-agent-setup-user-')
+    + GetDateTimeString('yyyymmddhhnnsszzz', #0, #0) + '-' + IntToStr(Random(2147483647)) + '.txt';
+  DeleteFile(NameFile);
+  if ExecAsOriginalUser(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -Command "[IO.File]::WriteAllText(''' + NameFile + ''', $env:USERDOMAIN + ''\'' + $env:USERNAME, '
+      + '[Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage))"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+    and (ResultCode = 0) and LoadStringsFromFile(NameFile, Lines) and (GetArrayLength(Lines) > 0) then
     Result := Trim(Lines[0]);
+  DeleteFile(NameFile);
 end;
 
 function RunHidden(FileName: string; Parameters: string): Boolean;
 var
   ResultCode: Integer;
 begin
-  Result := Exec(FileName, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := Exec(FileName, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
 end;
 
 { True when the setup was started by the HASS.Agent silent self-update.
@@ -206,6 +242,7 @@ end;
 procedure EnsureConfigDirectoryPermissions();
 var
   Users: string;
+  Elevated: string;
   Original: string;
 begin
   { PreviousVersion, read before the files went in: by now this setup is registered itself.
@@ -215,11 +252,22 @@ begin
     and (CompareText(ExpandConstant('{username}'), 'SYSTEM') <> 0)
     and (Copy(ExpandConstant('{username}'), Length(ExpandConstant('{username}')), 1) <> '$') then
   begin
-    Users := '"' + ExpandConstant('{username}') + '"';
+    Elevated := SetupUserName();
+    Users := '"' + Elevated + '"';
     Original := OriginalUserName();
-    if (Original <> '') and (CompareText(Original, ExpandConstant('{username}')) <> 0) then
+    if (Original <> '') and (CompareText(Original, Elevated) <> 0) then
       Users := Users + ' "' + Original + '"';
-    RunHidden(ExpandConstant('{app}\{#MyAppExeName}'), '--settings-access only ' + Users + ' --quiet');
+    if not RunHidden(ExpandConstant('{app}\{#MyAppExeName}'), '--settings-access only ' + Users + ' --quiet') then
+    begin
+      Log('Limiting the settings to ' + Users + ' failed.');
+      MsgBox(CustomMessage('AccessFailed'), mbError, MB_OK);
+    end
+    else if Original = '' then
+    begin
+      { "Only me" with nobody known to be me but the account Setup runs as: said, not left to be found out. }
+      Log('The user who started Setup could not be determined; limited to ' + Elevated + '.');
+      MsgBox(FmtMessage(CustomMessage('AccessUserUnknown'), [Elevated]), mbInformation, MB_OK);
+    end;
   end
   else if (PreviousVersion = '') and WizardIsTaskSelected('accessall') and (not WizardSilent()) then
     RunHidden(ExpandConstant('{app}\{#MyAppExeName}'), '--settings-access everyone --quiet')

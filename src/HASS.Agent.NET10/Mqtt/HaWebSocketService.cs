@@ -150,14 +150,15 @@ internal sealed class HaWebSocketService : IDisposable
         // Step 4: Check the installed HASS.Agent integration version.
         await LogIntegrationVersionCompatibilityAsync(cancellationToken);
 
-        // Step 5: Subscribe to hass_agent_command events.
-        await SubscribeToCommandEventsAsync(cancellationToken);
-
-        // Step 6: whose token this is (shown on the HA API page). An administrator's token
+        // Step 5: whose token this is (shown on the HA API page). An administrator's token
         // can be swapped for a user of the PC's own, which the integration's commands allow.
+        // Known before the subscription: it decides what to try when the integration is not up.
         var userId = await SendWithIdAsync(i => new { id = i, type = "auth/current_user" }, cancellationToken);
         var (ok, _, _, result) = await ReadResultAsync(userId, cancellationToken);
         TokenUser = ok ? HaTokenUser.From(result) : null;
+
+        // Step 6: Subscribe to this PC's commands.
+        await SubscribeToCommandEventsAsync(cancellationToken);
 
         // Only now, with the connection authenticated and its user known, does it answer for
         // this address and token; until then the short check does.
@@ -218,8 +219,13 @@ internal sealed class HaWebSocketService : IDisposable
                 {
                     throw;
                 }
-                catch (WebSocketException)
+                catch (WebSocketException ex)
                 {
+                    if (ex.Message == MessageTooBig)
+                    {
+                        _log.Warning($"HA WebSocket: {ex.Message}");
+                    }
+
                     break;
                 }
 
@@ -655,6 +661,17 @@ internal sealed class HaWebSocketService : IDisposable
             throw new InvalidOperationException($"HA WebSocket hass_agent/subscribe failed: {code} {message}");
         }
 
+        if (!FallsBackToSubscribeEvents(TokenUser))
+        {
+            // Home Assistant is still starting (right after its restart the PC is in before the
+            // integration is loaded), or the integration is not set up. Nothing to try meanwhile:
+            // subscribe_events needs an administrator, and asking would only put an error in Home
+            // Assistant's log. The next attempt gets in once the integration is up.
+            throw new InvalidOperationException(
+                "HA WebSocket: the HASS.Agent integration is not loaded yet, so this PC's commands cannot be subscribed to; " +
+                "trying again in a moment.");
+        }
+
         // An integration older than 10.9.1, or one that is not set up yet.
         var subscriptionId = await SendWithIdAsync(id => new
         {
@@ -677,6 +694,15 @@ internal sealed class HaWebSocketService : IDisposable
 
         _log.Info("HA WebSocket subscribed to hass_agent_command events.");
     }
+
+    /// <summary>
+    /// Whether Home Assistant's own subscribe_events is worth a try when the integration's
+    /// subscription is not there: only with an administrator's token (an integration older than
+    /// 10.9.1 is only ever used with one), or a token whose user could not be asked. A user who is
+    /// not an administrator is only ever set up with the newer integration, so the integration is
+    /// simply not up yet, and the request would be refused and logged as an error over there.
+    /// </summary>
+    internal static bool FallsBackToSubscribeEvents(HaTokenUser? tokenUser) => tokenUser is not { IsAdmin: false };
 
     /// <summary>The result of one command: success with its result, or the error code and message Home Assistant gave.</summary>
     private async Task<(bool Success, string? Code, string? Message, JsonElement? Result)> ReadResultAsync(int id, CancellationToken cancellationToken)
@@ -1074,7 +1100,14 @@ internal sealed class HaWebSocketService : IDisposable
         return ReceiveMessageAsync(_ws, cancellationToken);
     }
 
-    private static async Task<JsonDocument> ReceiveMessageAsync(ClientWebSocket ws, CancellationToken cancellationToken)
+    /// <summary>
+    /// The most one message from the server may be, the same as over MQTT. Home Assistant's own
+    /// messages are a few kilobytes; whatever answers at the address is not trusted to keep
+    /// sending until the memory runs out.
+    /// </summary>
+    internal const int MaxIncomingMessage = MqttCompanionService.MaxIncomingPayload;
+
+    internal static async Task<JsonDocument> ReceiveMessageAsync(WebSocket ws, CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(8192);
         try
@@ -1089,6 +1122,13 @@ internal sealed class HaWebSocketService : IDisposable
                     throw new WebSocketException("Server closed the connection.");
                 }
 
+                // Checked fragment by fragment: the size of a message is only known at its end.
+                if (ms.Length + result.Count > MaxIncomingMessage)
+                {
+                    await CloseTooBigAsync(ws);
+                    throw new WebSocketException(WebSocketError.Faulted, MessageTooBig);
+                }
+
                 ms.Write(buffer, 0, result.Count);
             }
             while (!result.EndOfMessage);
@@ -1101,6 +1141,22 @@ internal sealed class HaWebSocketService : IDisposable
             ArrayPool<byte>.Shared.Return(buffer);
         }
     }
+
+    // Tells the server why, when it still listens; the connection is dropped either way.
+    private static async Task CloseTooBigAsync(WebSocket ws)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await ws.CloseOutputAsync(WebSocketCloseStatus.MessageTooBig, "message too big", timeout.Token);
+        }
+        catch (Exception)
+        {
+            // The connection is being dropped anyway.
+        }
+    }
+
+    internal const string MessageTooBig = "a message from the server is larger than 1 MiB; the connection was closed.";
 }
 
 /// <summary>The Home Assistant user a token belongs to.</summary>

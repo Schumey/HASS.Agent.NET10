@@ -160,8 +160,12 @@ internal sealed class MqttCompanionService : IDisposable
         await _restartLock.WaitAsync();
         try
         {
-            if (!_settings.MqttEnabled && !_settings.HaApiEnabled)
+            if (!_settings.MqttEnabled)
             {
+                // Turned off: a goodbye on the broker first, so Home Assistant does not go on
+                // taking the PC for one on MQTT by the retained messages. With the HA API on,
+                // the runtime starts again on that alone; NeedsReconnect below does not see
+                // the switch itself, and a connected client would otherwise just carry on.
                 if (_client is { IsConnected: true })
                 {
                     _log.Info("MQTT disabled, publishing offline discovery.");
@@ -169,6 +173,12 @@ internal sealed class MqttCompanionService : IDisposable
                 }
 
                 await StopAsync(publishOffline: false);
+                if (_settings.HaApiEnabled)
+                {
+                    _log.Info("Continuing on the HA WebSocket API.");
+                    Start();
+                }
+
                 return;
             }
 
@@ -457,7 +467,7 @@ internal sealed class MqttCompanionService : IDisposable
                 return;
             }
 
-            others = SettingsAccess.NonAdministratorUsers();
+            others = SettingsAccess.UsersNotKnownToBeAdministrators();
         }
         catch (Exception ex)
         {
@@ -2226,7 +2236,7 @@ internal sealed class MqttCompanionService : IDisposable
 
     private IReadOnlyList<BuiltInSensorDescriptor> BuildStandardSensorDescriptors(bool serviceRole)
     {
-        return _settings.BuiltInSensors
+        var descriptors = _settings.BuiltInSensors
             .Where(sensor => serviceRole ? sensor.Service : sensor.TrayApp)
             .Select(sensor => BuiltInSensorCatalog.Find(sensor.Key))
             .Where(sensor => sensor is not null)
@@ -2239,6 +2249,19 @@ internal sealed class MqttCompanionService : IDisposable
                 sensor.AttributePaths,
                 sensor.DeviceClass,
                 sensor.Options))
+            .ToList();
+
+        // A renamed sensor is advertised under its key of before as well, with the same name:
+        // an integration from before keeps its entity by it, a newer one folds it into the new.
+        return descriptors.Concat(descriptors
+            .Select(descriptor => (Descriptor: descriptor, Former: BuiltInSensorCatalog.FormerKey(descriptor.Key)))
+            .Where(pair => pair.Former is not null)
+            .Select(pair => pair.Descriptor with
+            {
+                Key = pair.Former!,
+                DefaultAttributePath = pair.Descriptor.DefaultAttributePath is { } path ? pair.Former + path[pair.Descriptor.Key.Length..] : null,
+                AttributePaths = pair.Descriptor.AttributePaths?.Select(path => pair.Former + path[pair.Descriptor.Key.Length..]).ToList(),
+            }))
             .ToList();
     }
 
