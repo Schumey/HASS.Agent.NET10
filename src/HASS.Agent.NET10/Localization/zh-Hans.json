@@ -4,6 +4,15 @@
     "name": "中文(简体)",
     "cultures": [
       "zh-Hans"
+    ],
+    "todo": [
+      "Sensor.drive_space",
+      "Attribute.free_gb",
+      "Attribute.used_percent",
+      "Attribute.free_percent",
+      "Attribute.label",
+      "Attribute.file_system",
+      "Attribute.removable"
     ]
   },
   "strings": {
@@ -345,6 +354,12 @@
     "Attribute.used_gb": "已用(GB)",
     "Attribute.available_gb": "可用(GB)",
     "Attribute.drive": "磁盘",
+    "Attribute.label": "Label",
+    "Attribute.file_system": "File system",
+    "Attribute.removable": "Removable",
+    "Attribute.free_gb": "剩余(GB)",
+    "Attribute.used_percent": "已用(%)",
+    "Attribute.free_percent": "剩余(%)",
     "Attribute.temperature": "温度",
     "Attribute.health": "健康度",
     "Attribute.temperature_max": "最高温度",
@@ -503,6 +518,7 @@
     "Sensor.sleep_blocked": "阻止睡眠状态",
     "Sensor.gpu_usage": "GPU使用率",
     "Sensor.drive_health": "硬盘健康度",
+    "Sensor.drive_space": "磁盘空间",
     "Sensor.boot_time": "开机时间",
     "Sensor.battery_time_remaining": "电池剩余可用时间",
     "Sensor.vpn_connected": "VPN连接状态",
